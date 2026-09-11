@@ -7,7 +7,8 @@ import signal
 import subprocess
 import threading
 from pathlib import Path
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer
+import sys
 
 import requests
 
@@ -18,12 +19,18 @@ import requests
 # ============================================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-OWNER_CHAT_ID = os.getenv("OWNER_CHAT_ID", "").strip()
+
+# Telegram numeric Chat ID (Render Environment Variable se liya jayega)
+OWNER_CHAT_ID_RAW = os.getenv("OWNER_CHAT_ID", "").strip()
+try:
+    OWNER_CHAT_ID = int(OWNER_CHAT_ID_RAW) if OWNER_CHAT_ID_RAW else 0
+except ValueError:
+    OWNER_CHAT_ID = 0
 
 BRAND = "KRUTIK CYBER EXPERT"
 
 BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = Path(os.getenv("DATA_DIR", str(BASE_DIR / "host_data"))).resolve()
+DATA_DIR = Path(os.getenv("DATA_DIR", str(BASE_DIR / "host_data"))).expanduser()
 CLIENTS_DIR = DATA_DIR / "clients"
 DB_FILE = DATA_DIR / "host.db"
 
@@ -77,68 +84,6 @@ db.commit()
 
 db_lock = threading.Lock()
 
-
-
-# ============================================================
-# SECURITY HARDENING
-# ============================================================
-MAX_UPLOAD_SIZE = 2 * 1024 * 1024
-MAX_FILENAME_LENGTH = 100
-RATE_WINDOW = 60
-RATE_MAX = 30
-_rate_events = {}
-_rate_lock = threading.Lock()
-
-def security_owner(chat_id):
-    try:
-        return int(chat_id) == int(OWNER_CHAT_ID)
-    except (TypeError, ValueError):
-        return False
-
-def check_rate_limit(chat_id, action="general"):
-    now = time.time()
-    key = f"{chat_id}:{action}"
-    with _rate_lock:
-        events = [x for x in _rate_events.get(key, []) if now - x < RATE_WINDOW]
-        if len(events) >= RATE_MAX:
-            _rate_events[key] = events
-            return False
-        events.append(now)
-        _rate_events[key] = events
-        return True
-
-def validate_filename(filename):
-    if not filename or len(filename) > MAX_FILENAME_LENGTH:
-        return None
-    filename = str(filename).strip()
-    if "\x00" in filename or Path(filename).name != filename:
-        return None
-    if not re.fullmatch(r"[A-Za-z0-9_.-]+", filename):
-        return None
-    if not filename.lower().endswith(".py"):
-        return None
-    return filename
-
-def safe_bot_folder(bot):
-    if not bot:
-        return None
-    try:
-        owner_id = int(bot[1])
-        bot_id = int(bot[0])
-        expected = (CLIENTS_DIR / str(owner_id) / f"bot_{bot_id}").resolve()
-        actual = Path(bot[4]).resolve()
-        actual.relative_to(CLIENTS_DIR.resolve())
-        return actual if actual == expected else None
-    except Exception:
-        return None
-
-def can_control_bot(chat_id, bot):
-    if not bot:
-        return False
-    try:
-        return security_owner(chat_id) or int(chat_id) == int(bot[1])
-    except (TypeError, ValueError):
-        return False
 
 # ============================================================
 # TELEGRAM API
@@ -200,7 +145,8 @@ def answer_callback(callback_id, text=None):
 # ============================================================
 
 def is_owner(chat_id):
-    return security_owner(chat_id)
+
+    return int(chat_id) == int(OWNER_CHAT_ID)
 
 
 def client_exists(chat_id):
@@ -373,8 +319,10 @@ def client_folder(chat_id):
 
 def bot_folder(owner_id, bot_id):
 
-    folder = (client_folder(owner_id) / f"bot_{int(bot_id)}").resolve()
-    folder.relative_to(CLIENTS_DIR.resolve())
+    folder = (
+        client_folder(owner_id)
+        / f"bot_{bot_id}"
+    )
 
     folder.mkdir(
         parents=True,
@@ -385,7 +333,20 @@ def bot_folder(owner_id, bot_id):
 
 
 def safe_filename(filename):
-    return validate_filename(filename) or "bot.py"
+
+    filename = os.path.basename(filename)
+
+    filename = re.sub(
+        r"[^a-zA-Z0-9_.-]",
+        "_",
+        filename
+    )
+
+    if not filename:
+
+        filename = "bot.py"
+
+    return filename
 
 
 # ============================================================
@@ -587,15 +548,7 @@ def start_bot(bot_id):
 
         return False, "Bot is already running."
 
-    safe_folder = safe_bot_folder(bot)
-    if safe_folder is None:
-        return False, "Unsafe bot folder. Operation blocked."
-    folder = safe_folder
-    script = (folder / filename).resolve()
-    try:
-        script.relative_to(folder)
-    except ValueError:
-        return False, "Unsafe script path blocked."
+    script = folder / filename
 
     if not script.exists():
 
@@ -627,7 +580,7 @@ def start_bot(bot_id):
 
             process = subprocess.Popen(
                 [
-                    "python",
+                    sys.executable,
                     "-u",
                     str(script)
                 ],
@@ -1353,18 +1306,21 @@ def download_document(message, owner_id):
 
         return
 
-    raw_filename = document.get("file_name", "bot.py")
-    filename = validate_filename(raw_filename)
-    file_size = document.get("file_size")
+    filename = safe_filename(
+        document.get(
+            "file_name",
+            "bot.py"
+        )
+    )
 
-    if not filename:
+    if not filename.lower().endswith(
+        ".py"
+    ):
 
-
-        send_message(owner_id, "❌ Invalid filename. Sirf safe `.py` filename allowed hai.")
-        return
-
-    if file_size is not None and int(file_size) > MAX_UPLOAD_SIZE:
-        send_message(owner_id, "❌ File too large. Maximum 2 MB allowed hai.")
+        send_message(
+            owner_id,
+            "❌ Sirf `.py` files upload karo."
+        )
 
         return
 
@@ -1424,12 +1380,7 @@ def download_document(message, owner_id):
             bot[4]
         )
 
-        safe_folder = safe_bot_folder(bot)
-        if safe_folder is None:
-            send_message(owner_id, "❌ Unsafe bot folder. Upload cancelled.")
-            return
-        target = (safe_folder / filename).resolve()
-        target.relative_to(safe_folder)
+        target = folder / filename
 
         target.write_bytes(
             response.content
@@ -1484,12 +1435,6 @@ Now you can ▶️ Run the bot.""",
 # ============================================================
 
 def handle_callback(callback):
-    callback_id = callback.get("id")
-    message = callback.get("message", {})
-    chat_id = message.get("chat", {}).get("id")
-    if chat_id is not None and not check_rate_limit(chat_id, "callback"):
-        answer_callback(callback_id, "⚠️ Too many requests.")
-        return
 
     callback_id = callback["id"]
 
@@ -2474,6 +2419,31 @@ def polling():
 
 
 # ============================================================
+# RENDER HEALTH SERVER
+# ============================================================
+
+class HealthHandler(BaseHTTPRequestHandler):
+
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(b"KRUTIK CYBER EXPERT HOST is running")
+
+    def log_message(self, format, *args):
+        return
+
+
+def start_health_server():
+
+    port = int(os.getenv("PORT", "10000"))
+    server = HTTPServer(("0.0.0.0", port), HealthHandler)
+
+    print(f"🌐 Render health server listening on port {port}")
+    server.serve_forever()
+
+
+# ============================================================
 # MAIN
 # ============================================================
 
@@ -2482,7 +2452,7 @@ def main():
     if not BOT_TOKEN:
 
         print(
-            "❌ BOT_TOKEN set karo."
+            "❌ BOT_TOKEN environment variable set karo."
         )
 
         return
@@ -2510,6 +2480,11 @@ def main():
     print(
         "=" * 60
     )
+
+    threading.Thread(
+        target=start_health_server,
+        daemon=True
+    ).start()
 
     polling()
 
