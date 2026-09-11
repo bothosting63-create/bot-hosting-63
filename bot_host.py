@@ -27,7 +27,7 @@ try:
 except ValueError:
     OWNER_CHAT_ID = 0
 
-BRAND = "KRUTIK CYBER EXPERT"
+BRAND = "NEEV CYBER EXPERT"
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path(os.getenv("DATA_DIR", str(BASE_DIR / "host_data"))).expanduser()
