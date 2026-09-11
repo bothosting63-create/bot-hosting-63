@@ -1,16 +1,12 @@
 import os
 import re
-import sys
 import time
 import json
-import ast
-import signal
-import shutil
 import sqlite3
-import threading
+import signal
 import subprocess
+import threading
 from pathlib import Path
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import requests
 
@@ -18,125 +14,48 @@ import requests
 # ============================================================
 # KRUTIK CYBER EXPERT
 # MULTI-CLIENT TELEGRAM PYTHON HOST
-# Render Web Service compatible
 # ============================================================
-
-APP_NAME = "KRUTIK CYBER EXPERT"
-
-BASE_DIR = Path(__file__).resolve().parent
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 OWNER_CHAT_ID = os.getenv("OWNER_CHAT_ID", "").strip()
 
-DATA_DIR = Path(
-    os.getenv(
-        "DATA_DIR",
-        str(BASE_DIR / "host_data")
-    )
-).resolve()
+BRAND = "KRUTIK CYBER EXPERT"
 
+BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = BASE_DIR / "host_data"
 CLIENTS_DIR = DATA_DIR / "clients"
 DB_FILE = DATA_DIR / "host.db"
 
-DATA_DIR.mkdir(parents=True, exist_ok=True)
-CLIENTS_DIR.mkdir(parents=True, exist_ok=True)
+DATA_DIR.mkdir(exist_ok=True)
+CLIENTS_DIR.mkdir(exist_ok=True)
 
-TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
+
+API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 session = requests.Session()
 
-# ------------------------------------------------------------
-# Runtime
-# ------------------------------------------------------------
-
 processes = {}
-process_lock = threading.RLock()
+process_lock = threading.Lock()
 
-intentional_stops = set()
 user_states = {}
 
 START_TIME = time.time()
-
-MAX_UPLOAD_SIZE = 2 * 1024 * 1024
-MAX_FILENAME_LENGTH = 100
-MAX_LOG_SIZE = 8000
-
-RATE_WINDOW = 60
-RATE_MAX = 30
-
-rate_data = {}
-rate_lock = threading.Lock()
-
-
-# ============================================================
-# DEPENDENCY MAP
-# ============================================================
-
-IMPORT_TO_PACKAGE = {
-    "telegram": "python-telegram-bot>=22,<23",
-    "telegram.ext": "python-telegram-bot>=22,<23",
-    "aiogram": "aiogram>=3,<4",
-    "telebot": "pyTelegramBotAPI>=4,<5",
-    "openai": "openai>=1.50,<2",
-    "requests": "requests>=2.32,<3",
-    "httpx": "httpx>=0.27,<1",
-    "aiohttp": "aiohttp>=3,<4",
-    "flask": "Flask>=3,<4",
-    "fastapi": "fastapi>=0.115,<1",
-    "uvicorn": "uvicorn>=0.30,<1",
-    "bs4": "beautifulsoup4>=4,<5",
-    "PIL": "Pillow>=10,<12",
-    "cv2": "opencv-python-headless>=4,<5",
-    "dotenv": "python-dotenv>=1,<2",
-    "yaml": "PyYAML>=6,<7",
-    "Crypto": "pycryptodome>=3,<4",
-    "numpy": "numpy>=1.26,<3",
-    "pandas": "pandas>=2,<3",
-    "qrcode": "qrcode>=7,<9",
-    "schedule": "schedule>=1,<2",
-    "rich": "rich>=13,<15",
-    "colorama": "colorama>=0.4,<1",
-    "selenium": "selenium>=4,<5",
-    "jwt": "PyJWT>=2,<3",
-    "google": "google-api-python-client>=2,<3",
-    "discord": "discord.py>=2,<3",
-    "psutil": "psutil>=6,<8",
-}
-
-STDLIB = set(getattr(sys, "stdlib_module_names", set())) | {
-    "os", "sys", "time", "json", "re", "math", "random",
-    "datetime", "sqlite3", "subprocess", "threading",
-    "asyncio", "logging", "pathlib", "typing", "collections",
-    "itertools", "functools", "hashlib", "hmac", "base64",
-    "secrets", "signal", "socket", "http", "urllib", "email",
-    "io", "traceback", "shutil", "ast", "statistics",
-    "decimal", "csv", "string", "textwrap", "copy",
-    "dataclasses", "enum", "uuid", "platform",
-}
 
 
 # ============================================================
 # DATABASE
 # ============================================================
 
-db_lock = threading.RLock()
-
 db = sqlite3.connect(
     DB_FILE,
     check_same_thread=False
 )
 
-db.execute("PRAGMA journal_mode=WAL")
-db.execute("PRAGMA busy_timeout=10000")
-
 db.execute("""
 CREATE TABLE IF NOT EXISTS clients (
     chat_id INTEGER PRIMARY KEY,
-    username TEXT DEFAULT '',
-    first_name TEXT DEFAULT '',
-    last_name TEXT DEFAULT '',
-    status TEXT DEFAULT 'enabled',
-    created_at REAL NOT NULL
+    status TEXT NOT NULL DEFAULT 'enabled',
+    added_at REAL NOT NULL
 )
 """)
 
@@ -147,130 +66,27 @@ CREATE TABLE IF NOT EXISTS bots (
     name TEXT NOT NULL,
     filename TEXT NOT NULL,
     folder TEXT NOT NULL,
-    status TEXT DEFAULT 'stopped',
-    auto_restart INTEGER DEFAULT 1,
-    created_at REAL NOT NULL
-)
-""")
-
-db.execute("""
-CREATE TABLE IF NOT EXISTS settings (
-    key TEXT PRIMARY KEY,
-    value TEXT NOT NULL
-)
-""")
-
-db.execute("""
-CREATE TABLE IF NOT EXISTS audit (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    actor_id INTEGER NOT NULL,
-    action TEXT NOT NULL,
-    target TEXT DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'stopped',
+    auto_restart INTEGER NOT NULL DEFAULT 1,
     created_at REAL NOT NULL
 )
 """)
 
 db.commit()
 
-
-def db_one(sql, params=()):
-    with db_lock:
-        return db.execute(sql, params).fetchone()
-
-
-def db_all(sql, params=()):
-    with db_lock:
-        return db.execute(sql, params).fetchall()
-
-
-def db_exec(sql, params=()):
-    with db_lock:
-        cur = db.execute(sql, params)
-        db.commit()
-        return cur
-
-
-# ============================================================
-# AUTH / SECURITY
-# ============================================================
-
-def is_owner(chat_id):
-    try:
-        return int(chat_id) == int(OWNER_CHAT_ID)
-    except Exception:
-        return False
-
-
-def rate_ok(chat_id, action="general"):
-    if is_owner(chat_id):
-        return True
-
-    now = time.time()
-    key = f"{chat_id}:{action}"
-
-    with rate_lock:
-        values = rate_data.get(key, [])
-
-        values = [
-            x for x in values
-            if now - x < RATE_WINDOW
-        ]
-
-        if len(values) >= RATE_MAX:
-            rate_data[key] = values
-            return False
-
-        values.append(now)
-        rate_data[key] = values
-
-    return True
-
-
-def get_global_lock():
-    row = db_one(
-        "SELECT value FROM settings WHERE key='global_lock'"
-    )
-
-    return bool(row and row[0] == "1")
-
-
-def set_global_lock(value):
-    db_exec("""
-        INSERT INTO settings(key,value)
-        VALUES('global_lock',?)
-        ON CONFLICT(key)
-        DO UPDATE SET value=excluded.value
-    """, ("1" if value else "0",))
-
-
-def audit(actor, action, target=""):
-    try:
-        db_exec("""
-            INSERT INTO audit(
-                actor_id,
-                action,
-                target,
-                created_at
-            )
-            VALUES(?,?,?,?)
-        """, (
-            int(actor),
-            action,
-            str(target),
-            time.time()
-        ))
-    except Exception:
-        pass
+db_lock = threading.Lock()
 
 
 # ============================================================
 # TELEGRAM API
 # ============================================================
 
-def telegram(method, data=None, timeout=30):
+def api(method, data=None, timeout=20):
+
     try:
+
         response = session.post(
-            f"{TELEGRAM_API}/{method}",
+            f"{API}/{method}",
             data=data or {},
             timeout=timeout
         )
@@ -278,7 +94,7 @@ def telegram(method, data=None, timeout=30):
         return response.json()
 
     except Exception as e:
-        print("Telegram API error:", repr(e))
+
         return {
             "ok": False,
             "error": str(e)
@@ -286,37 +102,23 @@ def telegram(method, data=None, timeout=30):
 
 
 def send_message(chat_id, text, keyboard=None):
+
     data = {
         "chat_id": chat_id,
-        "text": str(text)
+        "text": text
     }
 
     if keyboard:
-        data["reply_markup"] = json.dumps(
-            keyboard,
-            ensure_ascii=False
-        )
+        data["reply_markup"] = json.dumps(keyboard)
 
-    return telegram("sendMessage", data)
-
-
-def edit_message(chat_id, message_id, text, keyboard=None):
-    data = {
-        "chat_id": chat_id,
-        "message_id": message_id,
-        "text": str(text)
-    }
-
-    if keyboard:
-        data["reply_markup"] = json.dumps(
-            keyboard,
-            ensure_ascii=False
-        )
-
-    return telegram("editMessageText", data)
+    return api(
+        "sendMessage",
+        data
+    )
 
 
-def answer_callback(callback_id, text=""):
+def answer_callback(callback_id, text=None):
+
     data = {
         "callback_query_id": callback_id
     }
@@ -324,60 +126,180 @@ def answer_callback(callback_id, text=""):
     if text:
         data["text"] = text
 
-    return telegram(
+    return api(
         "answerCallbackQuery",
         data
     )
 
 
-def owner_message(text, keyboard=None):
-    if OWNER_CHAT_ID:
-        return send_message(
-            OWNER_CHAT_ID,
-            text,
-            keyboard
+# ============================================================
+# AUTHORIZATION
+# ============================================================
+
+def is_owner(chat_id):
+
+    return int(chat_id) == int(OWNER_CHAT_ID)
+
+
+def client_exists(chat_id):
+
+    with db_lock:
+
+        row = db.execute(
+            """
+            SELECT status
+            FROM clients
+            WHERE chat_id = ?
+            """,
+            (int(chat_id),)
+        ).fetchone()
+
+    return row is not None
+
+
+def client_enabled(chat_id):
+
+    with db_lock:
+
+        row = db.execute(
+            """
+            SELECT status
+            FROM clients
+            WHERE chat_id = ?
+            """,
+            (int(chat_id),)
+        ).fetchone()
+
+    return row is not None and row[0] == "enabled"
+
+
+def authorized(chat_id):
+
+    if is_owner(chat_id):
+        return True
+
+    return client_enabled(chat_id)
+
+
+# ============================================================
+# CLIENT DATABASE FUNCTIONS
+# ============================================================
+
+def add_client(chat_id):
+
+    with db_lock:
+
+        db.execute(
+            """
+            INSERT OR REPLACE INTO clients
+            (chat_id, status, added_at)
+            VALUES (?, 'enabled', ?)
+            """,
+            (
+                int(chat_id),
+                time.time()
+            )
         )
 
+        db.commit()
 
-# ============================================================
-# CLIENTS
-# ============================================================
+    client_folder(int(chat_id))
 
-def get_client(chat_id):
-    return db_one("""
-        SELECT
-            chat_id,
-            username,
-            first_name,
-            last_name,
-            status,
-            created_at
-        FROM clients
-        WHERE chat_id=?
-    """, (int(chat_id),))
+
+def set_client_status(chat_id, status):
+
+    with db_lock:
+
+        db.execute(
+            """
+            UPDATE clients
+            SET status = ?
+            WHERE chat_id = ?
+            """,
+            (
+                status,
+                int(chat_id)
+            )
+        )
+
+        db.commit()
+
+
+def remove_client(chat_id):
+
+    stop_all_bots(int(chat_id))
+
+    with db_lock:
+
+        db.execute(
+            """
+            DELETE FROM bots
+            WHERE owner_id = ?
+            """,
+            (int(chat_id),)
+        )
+
+        db.execute(
+            """
+            DELETE FROM clients
+            WHERE chat_id = ?
+            """,
+            (int(chat_id),)
+        )
+
+        db.commit()
+
+    folder = client_folder(int(chat_id))
+
+    if folder.exists():
+
+        for item in folder.rglob("*"):
+
+            if item.is_file():
+
+                try:
+                    item.unlink()
+                except:
+                    pass
+
+        for item in sorted(
+            folder.rglob("*"),
+            reverse=True
+        ):
+
+            if item.is_dir():
+
+                try:
+                    item.rmdir()
+                except:
+                    pass
+
+        try:
+            folder.rmdir()
+        except:
+            pass
 
 
 def get_clients():
-    return db_all("""
-        SELECT
-            chat_id,
-            username,
-            first_name,
-            last_name,
-            status,
-            created_at
-        FROM clients
-        ORDER BY created_at ASC
-    """)
 
+    with db_lock:
+
+        return db.execute(
+            """
+            SELECT chat_id, status, added_at
+            FROM clients
+            ORDER BY added_at
+            """
+        ).fetchall()
+
+
+# ============================================================
+# FILESYSTEM ISOLATION
+# ============================================================
 
 def client_folder(chat_id):
-    folder = (
-        CLIENTS_DIR / str(int(chat_id))
-    ).resolve()
 
-    if CLIENTS_DIR not in folder.parents:
-        raise ValueError("Unsafe client path")
+    folder = CLIENTS_DIR / str(int(chat_id))
 
     folder.mkdir(
         parents=True,
@@ -387,396 +309,196 @@ def client_folder(chat_id):
     return folder
 
 
-def client_display(client):
-    cid, username, first, last, status, created = client
+def bot_folder(owner_id, bot_id):
 
-    if username:
-        name = f"@{username}"
-    else:
-        name = " ".join(
-            x for x in [first, last]
-            if x
-        ).strip()
-
-        if not name:
-            name = "No username"
-
-    return f"{name} | ID: {cid}"
-
-
-def register_client(user):
-    chat_id = int(user["id"])
-
-    username = user.get("username", "")
-    first = user.get("first_name", "")
-    last = user.get("last_name", "")
-
-    existing = get_client(chat_id)
-
-    if existing:
-        db_exec("""
-            UPDATE clients
-            SET username=?,
-                first_name=?,
-                last_name=?
-            WHERE chat_id=?
-        """, (
-            username,
-            first,
-            last,
-            chat_id
-        ))
-
-        client_folder(chat_id)
-
-        return False
-
-    db_exec("""
-        INSERT INTO clients(
-            chat_id,
-            username,
-            first_name,
-            last_name,
-            status,
-            created_at
-        )
-        VALUES(?,?,?,?,?,?)
-    """, (
-        chat_id,
-        username,
-        first,
-        last,
-        "enabled",
-        time.time()
-    ))
-
-    client_folder(chat_id)
-
-    audit(
-        OWNER_CHAT_ID or 0,
-        "new_client",
-        chat_id
+    folder = (
+        client_folder(owner_id)
+        / f"bot_{bot_id}"
     )
 
-    if not is_owner(chat_id):
-        display = (
-            f"@{username}"
-            if username
-            else first or "Unknown"
-        )
-
-        owner_message(
-            "🆕 NEW CLIENT\n\n"
-            f"👤 Username: {display}\n"
-            f"📝 Name: {(first + ' ' + last).strip() or 'N/A'}\n"
-            f"🆔 ID: {chat_id}\n"
-            f"⏰ {time.strftime('%Y-%m-%d %H:%M:%S')}",
-            {
-                "inline_keyboard": [[
-                    {
-                        "text": "👤 Open Client",
-                        "callback_data":
-                            f"client:{chat_id}"
-                    }
-                ]]
-            }
-        )
-
-    return True
-
-
-def client_enabled(chat_id):
-    if is_owner(chat_id):
-        return True
-
-    row = db_one("""
-        SELECT status
-        FROM clients
-        WHERE chat_id=?
-    """, (int(chat_id),))
-
-    return bool(
-        row and row[0] == "enabled"
+    folder.mkdir(
+        parents=True,
+        exist_ok=True
     )
 
-
-def authorized(chat_id):
-    if is_owner(chat_id):
-        return True
-
-    if get_global_lock():
-        return False
-
-    return client_enabled(chat_id)
+    return folder
 
 
-def set_client_status(chat_id, status):
-    db_exec("""
-        UPDATE clients
-        SET status=?
-        WHERE chat_id=?
-    """, (
-        status,
-        int(chat_id)
-    ))
+def safe_filename(filename):
 
-    audit(
-        OWNER_CHAT_ID or 0,
-        f"client_{status}",
-        chat_id
+    filename = os.path.basename(filename)
+
+    filename = re.sub(
+        r"[^a-zA-Z0-9_.-]",
+        "_",
+        filename
     )
+
+    if not filename:
+
+        filename = "bot.py"
+
+    return filename
 
 
 # ============================================================
 # BOT DATABASE
 # ============================================================
 
-def get_bot(bot_id):
-    return db_one("""
-        SELECT
-            id,
+def create_bot(owner_id, name, filename):
+
+    with db_lock:
+
+        cursor = db.execute(
+            """
+            INSERT INTO bots
+            (
+                owner_id,
+                name,
+                filename,
+                folder,
+                status,
+                auto_restart,
+                created_at
+            )
+            VALUES (?, ?, ?, '', 'stopped', 1, ?)
+            """,
+            (
+                int(owner_id),
+                name,
+                filename,
+                time.time()
+            )
+        )
+
+        bot_id = cursor.lastrowid
+
+        folder = bot_folder(
             owner_id,
-            name,
-            filename,
-            folder,
-            status,
-            auto_restart,
-            created_at
-        FROM bots
-        WHERE id=?
-    """, (int(bot_id),))
+            bot_id
+        )
+
+        db.execute(
+            """
+            UPDATE bots
+            SET folder = ?
+            WHERE id = ?
+            """,
+            (
+                str(folder),
+                bot_id
+            )
+        )
+
+        db.commit()
+
+    return bot_id
+
+
+def get_bot(bot_id):
+
+    with db_lock:
+
+        return db.execute(
+            """
+            SELECT
+                id,
+                owner_id,
+                name,
+                filename,
+                folder,
+                status,
+                auto_restart
+            FROM bots
+            WHERE id = ?
+            """,
+            (int(bot_id),)
+        ).fetchone()
 
 
 def get_client_bots(owner_id):
-    return db_all("""
-        SELECT
-            id,
-            owner_id,
-            name,
-            filename,
-            folder,
-            status,
-            auto_restart,
-            created_at
-        FROM bots
-        WHERE owner_id=?
-        ORDER BY id
-    """, (int(owner_id),))
+
+    with db_lock:
+
+        return db.execute(
+            """
+            SELECT
+                id,
+                name,
+                filename,
+                status,
+                auto_restart
+            FROM bots
+            WHERE owner_id = ?
+            ORDER BY id
+            """,
+            (int(owner_id),)
+        ).fetchall()
 
 
-def get_all_bots():
-    return db_all("""
-        SELECT
-            id,
-            owner_id,
-            name,
-            filename,
-            folder,
-            status,
-            auto_restart,
-            created_at
-        FROM bots
-        ORDER BY id
-    """)
+def set_bot_status(bot_id, status):
 
+    with db_lock:
 
-def safe_filename(filename):
-    if not filename:
-        return None
+        db.execute(
+            """
+            UPDATE bots
+            SET status = ?
+            WHERE id = ?
+            """,
+            (
+                status,
+                int(bot_id)
+            )
+        )
 
-    filename = Path(filename).name
-
-    if len(filename) > MAX_FILENAME_LENGTH:
-        return None
-
-    if "\x00" in filename:
-        return None
-
-    if not re.fullmatch(
-        r"[A-Za-z0-9_.-]+",
-        filename
-    ):
-        return None
-
-    if not filename.lower().endswith(".py"):
-        return None
-
-    return filename
-
-
-def bot_path(bot):
-    folder = Path(bot[4]).resolve()
-
-    if CLIENTS_DIR not in folder.parents:
-        raise ValueError("Unsafe bot folder")
-
-    return folder
-
-
-def bot_script(bot):
-    path = bot_path(bot) / bot[3]
-
-    if path.parent != bot_path(bot):
-        raise ValueError("Unsafe script path")
-
-    return path
-
-
-def bot_python(bot):
-    return bot_path(bot) / ".venv" / "bin" / "python"
+        db.commit()
 
 
 # ============================================================
-# IMPORT DETECTION
+# LOGGING
 # ============================================================
 
-def detect_imports(source):
-    imports = set()
+def log_file(bot_id):
 
-    try:
-        tree = ast.parse(source)
+    bot = get_bot(bot_id)
 
-    except SyntaxError:
-        return imports
+    if not bot:
+        return None
 
-    for node in ast.walk(tree):
+    folder = Path(bot[4])
 
-        if isinstance(node, ast.Import):
-            for item in node.names:
-                imports.add(
-                    item.name.split(".")[0]
-                )
-
-        elif isinstance(node, ast.ImportFrom):
-            if node.module:
-                imports.add(
-                    node.module.split(".")[0]
-                )
-
-    return imports
-
-
-def dependency_list(source):
-    imports = detect_imports(source)
-
-    packages = []
-
-    for module in sorted(imports):
-
-        if module in STDLIB:
-            continue
-
-        if module in IMPORT_TO_PACKAGE:
-            package = IMPORT_TO_PACKAGE[module]
-
-            if package not in packages:
-                packages.append(package)
-
-    return packages
-
-
-# ============================================================
-# VENV
-# ============================================================
-
-def ensure_venv(bot):
-    folder = bot_path(bot)
-    venv = folder / ".venv"
-
-    python = (
-        venv / "bin" / "python"
-        if os.name != "nt"
-        else venv / "Scripts" / "python.exe"
+    folder.mkdir(
+        parents=True,
+        exist_ok=True
     )
 
-    if not python.exists():
-
-        print(
-            f"[BOT {bot[0]}] Creating virtual environment"
-        )
-
-        result = subprocess.run(
-            [
-                sys.executable,
-                "-m",
-                "venv",
-                str(venv)
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            timeout=300
-        )
-
-        if result.returncode != 0:
-            raise RuntimeError(
-                "venv creation failed:\n" +
-                result.stdout[-3000:]
-            )
-
-    return python
+    return folder / "bot.log"
 
 
-def install_dependencies(bot):
-    script = bot_script(bot)
+def write_log(bot_id, text):
+
+    path = log_file(bot_id)
+
+    if not path:
+        return
 
     try:
-        source = script.read_text(
+
+        with open(
+            path,
+            "a",
             encoding="utf-8",
             errors="replace"
-        )
-    except Exception:
-        return
+        ) as f:
 
-    packages = dependency_list(source)
+            f.write(
+                f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] "
+                f"{text}\n"
+            )
 
-    if not packages:
-        return
-
-    python = ensure_venv(bot)
-
-    marker = bot_path(bot) / ".requirements_installed"
-
-    desired = "\n".join(packages)
-
-    if marker.exists():
-        try:
-            if marker.read_text(
-                encoding="utf-8"
-            ) == desired:
-                return
-        except Exception:
-            pass
-
-    print(
-        f"[BOT {bot[0]}] Installing: {packages}"
-    )
-
-    result = subprocess.run(
-        [
-            str(python),
-            "-m",
-            "pip",
-            "install",
-            "--disable-pip-version-check",
-            *packages
-        ],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        timeout=600
-    )
-
-    if result.returncode != 0:
-        raise RuntimeError(
-            "Dependency installation failed:\n" +
-            result.stdout[-5000:]
-        )
-
-    marker.write_text(
-        desired,
-        encoding="utf-8"
-    )
+    except:
+        pass
 
 
 # ============================================================
@@ -784,1063 +506,933 @@ def install_dependencies(bot):
 # ============================================================
 
 def process_alive(bot_id):
+
     with process_lock:
-        p = processes.get(int(bot_id))
 
-        if not p:
-            return False
-
-        return p.poll() is None
-
-
-def update_bot_status(bot_id, status):
-    db_exec("""
-        UPDATE bots
-        SET status=?
-        WHERE id=?
-    """, (
-        status,
-        int(bot_id)
-    ))
-
-
-def kill_process_group(p, force=False):
-    if not p:
-        return
-
-    if p.poll() is not None:
-        return
-
-    try:
-
-        if os.name == "posix":
-
-            try:
-                os.killpg(
-                    os.getpgid(p.pid),
-                    signal.SIGKILL if force
-                    else signal.SIGTERM
-                )
-
-            except ProcessLookupError:
-                pass
-
-        else:
-
-            if force:
-                p.kill()
-            else:
-                p.terminate()
-
-    except Exception as e:
-        print(
-            "Process termination error:",
-            e
+        p = processes.get(
+            int(bot_id)
         )
 
-
-def stop_bot(bot_id, intentional=True):
-    bot = get_bot(bot_id)
-
-    if not bot:
-        return False
-
-    bot_id = int(bot_id)
-
-    if intentional:
-        intentional_stops.add(bot_id)
-
-    with process_lock:
-        p = processes.get(bot_id)
-
-    if p:
-        kill_process_group(p, force=False)
-
-        try:
-            p.wait(timeout=8)
-        except Exception:
-            kill_process_group(
-                p,
-                force=True
-            )
-
-            try:
-                p.wait(timeout=3)
-            except Exception:
-                pass
-
-    with process_lock:
-        processes.pop(bot_id, None)
-
-    update_bot_status(
-        bot_id,
-        "stopped"
+    return (
+        p is not None
+        and p.poll() is None
     )
-
-    return True
 
 
 def start_bot(bot_id):
+
     bot = get_bot(bot_id)
 
     if not bot:
+
         return False, "Bot not found."
 
-    bot_id = int(bot_id)
+    bot_id = int(bot[0])
+    owner_id = int(bot[1])
+    filename = bot[3]
+    folder = Path(bot[4])
+
+    if not client_enabled(owner_id) and not is_owner(owner_id):
+
+        return False, "Client is disabled."
 
     if process_alive(bot_id):
-        return True, "Bot is already running."
 
-    script = bot_script(bot)
+        return False, "Bot is already running."
+
+    script = folder / filename
 
     if not script.exists():
+
         return False, "Python file not found."
 
-    try:
-        source = script.read_text(
-            encoding="utf-8",
-            errors="replace"
-        )
-
-        compile(
-            source,
-            str(script),
-            "exec"
-        )
-
-    except SyntaxError as e:
-        update_bot_status(
-            bot_id,
-            "error"
-        )
-
-        return False, (
-            "❌ Syntax error:\n"
-            f"{e}"
-        )
-
-    except Exception as e:
-        return False, str(e)
+    log = log_file(bot_id)
 
     try:
-        install_dependencies(bot)
 
-        python = bot_python(bot)
+        log.parent.mkdir(
+            parents=True,
+            exist_ok=True
+        )
 
-        if not python.exists():
-            python = ensure_venv(bot)
-
-        log_file = bot_path(bot) / "bot.log"
-
-        log = open(
-            log_file,
+        with open(
+            log,
             "a",
-            encoding="utf-8",
-            buffering=1
-        )
+            encoding="utf-8"
+        ) as log_handle:
 
-        log.write(
-            "\n\n"
-            + "=" * 60
-            + "\n"
-            + f"START {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
-            + "=" * 60
-            + "\n"
-        )
+            log_handle.write(
+                "\n\n"
+                + "=" * 60
+                + "\n"
+                + f"STARTING BOT {bot_id}\n"
+                + "=" * 60
+                + "\n"
+            )
 
-        kwargs = {
-            "cwd": str(bot_path(bot)),
-            "stdout": log,
-            "stderr": subprocess.STDOUT,
-            "stdin": subprocess.DEVNULL,
-            "text": True,
-        }
-
-        if os.name == "posix":
-            kwargs["start_new_session"] = True
-
-        p = subprocess.Popen(
-            [
-                str(python),
-                str(script)
-            ],
-            **kwargs
-        )
+            process = subprocess.Popen(
+                [
+                    "python",
+                    "-u",
+                    str(script)
+                ],
+                cwd=str(folder),
+                stdout=log_handle,
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL
+            )
 
         with process_lock:
-            processes[bot_id] = p
 
-        intentional_stops.discard(bot_id)
+            processes[bot_id] = process
 
-        update_bot_status(
+        set_bot_status(
             bot_id,
             "running"
         )
 
+        write_log(
+            bot_id,
+            f"PID: {process.pid}"
+        )
+
         threading.Thread(
             target=watch_process,
-            args=(bot_id, p),
+            args=(bot_id,),
             daemon=True
         ).start()
 
-        return True, "✅ Bot started."
+        return True, f"Bot started. PID: {process.pid}"
 
     except Exception as e:
 
-        update_bot_status(
+        write_log(
             bot_id,
-            "error"
+            f"START ERROR: {repr(e)}"
         )
 
-        return False, (
-            "❌ Start failed:\n"
-            + str(e)
-        )
+        return False, str(e)
 
 
-def watch_process(bot_id, p):
-    try:
-        code = p.wait()
+def stop_bot(bot_id):
 
-    except Exception:
-        code = -1
+    bot_id = int(bot_id)
 
     with process_lock:
-        current = processes.get(bot_id)
 
-        if current is p:
+        process = processes.get(
+            bot_id
+        )
+
+    if not process:
+
+        set_bot_status(
+            bot_id,
+            "stopped"
+        )
+
+        return False, "Bot is not running."
+
+    try:
+
+        if process.poll() is None:
+
+            process.terminate()
+
+            try:
+
+                process.wait(
+                    timeout=5
+                )
+
+            except subprocess.TimeoutExpired:
+
+                process.kill()
+                process.wait()
+
+        with process_lock:
+
             processes.pop(
                 bot_id,
                 None
             )
 
-    if bot_id in intentional_stops:
-        intentional_stops.discard(bot_id)
-
-        update_bot_status(
+        set_bot_status(
             bot_id,
             "stopped"
         )
 
-        return
+        write_log(
+            bot_id,
+            "Bot stopped."
+        )
 
-    update_bot_status(
-        bot_id,
-        "crashed"
-        if code != 0
-        else "stopped"
-    )
+        return True, "Bot stopped."
 
-    bot = get_bot(bot_id)
+    except Exception as e:
 
-    if not bot:
-        return
-
-    if (
-        code != 0
-        and bot[6] == 1
-        and client_enabled(bot[1])
-    ):
-        time.sleep(2)
-
-        if (
-            bot_id not in intentional_stops
-            and not process_alive(bot_id)
-        ):
-            start_bot(bot_id)
+        return False, str(e)
 
 
 def restart_bot(bot_id):
-    stop_bot(
-        bot_id,
-        intentional=True
-    )
 
-    time.sleep(1)
+    stop_bot(bot_id)
+
+    time.sleep(0.5)
 
     return start_bot(bot_id)
 
 
-def stop_all_bots(owner_id=None):
-    bots = (
-        get_client_bots(owner_id)
-        if owner_id is not None
-        else get_all_bots()
-    )
+def watch_process(bot_id):
 
-    count = 0
-
-    for bot in bots:
-
-        if stop_bot(
-            bot[0],
-            intentional=True
-        ):
-            count += 1
-
-    return count
-
-
-# ============================================================
-# BOT CREATION / DELETE
-# ============================================================
-
-def create_bot(
-    owner_id,
-    name,
-    filename,
-    content
-):
-    filename = safe_filename(filename)
-
-    if not filename:
-        raise ValueError(
-            "Only safe .py filenames are allowed."
-        )
-
-    owner_id = int(owner_id)
-
-    folder = (
-        CLIENTS_DIR /
-        str(owner_id) /
-        f"bot_{int(time.time() * 1000)}"
-    ).resolve()
-
-    if CLIENTS_DIR not in folder.parents:
-        raise ValueError("Unsafe path")
-
-    folder.mkdir(
-        parents=True,
-        exist_ok=False
-    )
-
-    script = folder / filename
-
-    if len(content) > MAX_UPLOAD_SIZE:
-        shutil.rmtree(
-            folder,
-            ignore_errors=True
-        )
-
-        raise ValueError(
-            "File is too large. Maximum 2 MB."
-        )
-
-    script.write_bytes(content)
-
-    try:
-        source = content.decode(
-            "utf-8"
-        )
-
-        compile(
-            source,
-            str(script),
-            "exec"
-        )
-
-    except Exception:
-        shutil.rmtree(
-            folder,
-            ignore_errors=True
-        )
-
-        raise
-
-    cur = db_exec("""
-        INSERT INTO bots(
-            owner_id,
-            name,
-            filename,
-            folder,
-            status,
-            auto_restart,
-            created_at
-        )
-        VALUES(?,?,?,?,?,?,?)
-    """, (
-        owner_id,
-        name[:100],
-        filename,
-        str(folder),
-        "stopped",
-        1,
-        time.time()
-    ))
-
-    bot_id = cur.lastrowid
-
-    audit(
-        owner_id,
-        "create_bot",
-        bot_id
-    )
-
-    return bot_id
-
-
-def delete_bot(bot_id):
     bot = get_bot(bot_id)
 
     if not bot:
-        return False
+        return
 
-    stop_bot(
-        bot_id,
-        intentional=True
+    auto_restart = bool(
+        bot[6]
     )
 
-    folder = bot_path(bot)
+    with process_lock:
 
-    db_exec(
-        "DELETE FROM bots WHERE id=?",
-        (int(bot_id),)
-    )
-
-    shutil.rmtree(
-        folder,
-        ignore_errors=True
-    )
-
-    intentional_stops.discard(
-        int(bot_id)
-    )
-
-    audit(
-        OWNER_CHAT_ID or 0,
-        "delete_bot",
-        bot_id
-    )
-
-    return True
-
-
-def delete_client(client_id):
-    client_id = int(client_id)
-
-    if is_owner(client_id):
-        return False
-
-    stop_all_bots(
-        owner_id=client_id
-    )
-
-    bots = get_client_bots(client_id)
-
-    db_exec(
-        "DELETE FROM bots WHERE owner_id=?",
-        (client_id,)
-    )
-
-    db_exec(
-        "DELETE FROM clients WHERE chat_id=?",
-        (client_id,)
-    )
-
-    folder = (
-        CLIENTS_DIR /
-        str(client_id)
-    ).resolve()
-
-    if CLIENTS_DIR in folder.parents:
-        shutil.rmtree(
-            folder,
-            ignore_errors=True
+        process = processes.get(
+            int(bot_id)
         )
 
+    if not process:
+        return
+
+    exit_code = process.wait()
+
+    with process_lock:
+
+        processes.pop(
+            int(bot_id),
+            None
+        )
+
+    write_log(
+        bot_id,
+        f"Process exited with code {exit_code}"
+    )
+
+    set_bot_status(
+        bot_id,
+        "stopped"
+    )
+
+    if auto_restart:
+
+        time.sleep(2)
+
+        current = get_bot(bot_id)
+
+        if current and current[5] != "deleted":
+
+            owner_id = int(
+                current[1]
+            )
+
+            if client_enabled(owner_id):
+
+                write_log(
+                    bot_id,
+                    "Auto-restarting..."
+                )
+
+                start_bot(
+                    bot_id
+                )
+
+
+def stop_all_bots(owner_id):
+
+    bots = get_client_bots(
+        owner_id
+    )
+
     for bot in bots:
-        intentional_stops.discard(
+
+        stop_bot(
             int(bot[0])
         )
 
-    audit(
-        OWNER_CHAT_ID or 0,
-        "delete_client",
-        client_id
+
+def restart_all_bots(owner_id):
+
+    bots = get_client_bots(
+        owner_id
     )
 
-    return True
+    results = []
 
+    for bot in bots:
 
-# ============================================================
-# LOGS
-# ============================================================
-
-def read_logs(bot_id):
-    bot = get_bot(bot_id)
-
-    if not bot:
-        return "Bot not found."
-
-    path = bot_path(bot) / "bot.log"
-
-    if not path.exists():
-        return "No logs yet."
-
-    try:
-        data = path.read_text(
-            encoding="utf-8",
-            errors="replace"
+        ok, msg = restart_bot(
+            int(bot[0])
         )
 
-        return data[-MAX_LOG_SIZE:]
+        results.append(
+            f"{bot[1]}: {msg}"
+        )
 
-    except Exception as e:
-        return str(e)
+    return results
 
 
 # ============================================================
 # KEYBOARDS
 # ============================================================
 
-def owner_panel_keyboard():
+def owner_menu():
+
     return {
         "inline_keyboard": [
+
             [
                 {
                     "text": "👥 Clients",
-                    "callback_data": "owner:clients"
+                    "callback_data": "clients"
                 },
                 {
-                    "text": "🤖 All Bots",
-                    "callback_data": "owner:bots"
+                    "text": "➕ Add Client",
+                    "callback_data": "addclient"
                 }
             ],
+
             [
                 {
-                    "text": "🛑 Stop All Bots",
-                    "callback_data": "owner:stopall"
-                }
-            ],
-            [
-                {
-                    "text": "🔒 Lock All Clients",
-                    "callback_data": "owner:lock"
+                    "text": "📊 All Bots",
+                    "callback_data": "allbots"
                 },
                 {
-                    "text": "🔓 Unlock All Clients",
-                    "callback_data": "owner:unlock"
+                    "text": "📈 Host Status",
+                    "callback_data": "hoststatus"
                 }
             ],
+
             [
                 {
-                    "text": "🔐 Hosting Access",
-                    "callback_data": "owner:access"
+                    "text": "▶️ Run All",
+                    "callback_data": "runall"
+                },
+                {
+                    "text": "🛑 Stop All",
+                    "callback_data": "stopall"
+                }
+            ],
+
+            [
+                {
+                    "text": "🔄 Restart All",
+                    "callback_data": "restartall"
                 }
             ]
+
         ]
     }
 
 
-def client_panel_keyboard():
+def client_menu():
+
     return {
         "inline_keyboard": [
+
+            [
+                {
+                    "text": "📤 Upload Bot",
+                    "callback_data": "upload"
+                }
+            ],
+
             [
                 {
                     "text": "🤖 My Bots",
-                    "callback_data": "my:bots"
+                    "callback_data": "mybots"
                 }
             ],
+
             [
                 {
-                    "text": "ℹ️ Status",
-                    "callback_data": "my:status"
+                    "text": "▶️ Run All",
+                    "callback_data": "myrunall"
+                },
+                {
+                    "text": "🛑 Stop All",
+                    "callback_data": "mystopall"
+                }
+            ],
+
+            [
+                {
+                    "text": "🔄 Restart All",
+                    "callback_data": "myrestartall"
                 }
             ]
+
         ]
     }
 
 
-def bot_keyboard(bot_id, owner=True):
-    rows = [
-        [
-            {
-                "text": "▶️ Start",
-                "callback_data":
-                    f"bot:start:{bot_id}"
-            },
-            {
-                "text": "⏹ Stop",
-                "callback_data":
-                    f"bot:stop:{bot_id}"
-            }
-        ],
-        [
-            {
-                "text": "🔄 Restart",
-                "callback_data":
-                    f"bot:restart:{bot_id}"
-            },
-            {
-                "text": "📜 Logs",
-                "callback_data":
-                    f"bot:logs:{bot_id}"
-            }
-        ],
-        [
-            {
-                "text": "🗑 Delete",
-                "callback_data":
-                    f"bot:delete:{bot_id}"
-            }
-        ],
-        [
-            {
-                "text": "⬅️ Back",
-                "callback_data":
-                    "owner:bots"
-                    if owner
-                    else "my:bots"
-            }
-        ]
-    ]
+# ============================================================
+# OWNER PANEL
+# ============================================================
 
-    return {
-        "inline_keyboard": rows
+def show_owner(chat_id):
+
+    send_message(
+        chat_id,
+
+        f"""👑 {BRAND}
+
+OWNER CONTROL PANEL
+
+🔐 Access: FULL OWNER
+
+You can manage all clients
+and all hosted bots.
+
+Choose an option below:""",
+
+        owner_menu()
+    )
+
+
+# ============================================================
+# CLIENT PANEL
+# ============================================================
+
+def show_client(chat_id):
+
+    send_message(
+        chat_id,
+
+        f"""🚀 {BRAND}
+
+CLIENT PANEL
+
+🟢 Access: ENABLED
+🆔 Client ID: {chat_id}
+
+You can manage only
+your own hosted bots.
+
+Choose an option:""",
+
+        client_menu()
+    )
+
+
+# ============================================================
+# CLIENT LIST
+# ============================================================
+
+def show_clients(chat_id):
+
+    clients = get_clients()
+
+    if not clients:
+
+        send_message(
+            chat_id,
+            "👥 CLIENTS\n\nNo clients added yet."
+        )
+
+        return
+
+    text = f"👥 {BRAND} CLIENTS\n\n"
+
+    keyboard = []
+
+    for client in clients:
+
+        cid = client[0]
+        status = client[1]
+
+        icon = (
+            "🟢"
+            if status == "enabled"
+            else "🔴"
+        )
+
+        text += (
+            f"{icon} `{cid}` → "
+            f"{status.upper()}\n"
+        )
+
+        keyboard.append(
+            [
+                {
+                    "text": f"{icon} {cid}",
+                    "callback_data":
+                        f"client:{cid}"
+                }
+            ]
+        )
+
+    send_message(
+        chat_id,
+        text,
+        {
+            "inline_keyboard":
+                keyboard
+        }
+    )
+
+
+# ============================================================
+# CLIENT MANAGEMENT PANEL
+# ============================================================
+
+def client_management(chat_id, client_id):
+
+    clients = get_clients()
+
+    found = None
+
+    for c in clients:
+
+        if int(c[0]) == int(client_id):
+
+            found = c
+            break
+
+    if not found:
+
+        send_message(
+            chat_id,
+            "❌ Client not found."
+        )
+
+        return
+
+    status = found[1]
+
+    keyboard = {
+        "inline_keyboard": [
+
+            [
+                {
+                    "text": "✅ Enable",
+                    "callback_data":
+                        f"enable:{client_id}"
+                },
+                {
+                    "text": "🚫 Disable",
+                    "callback_data":
+                        f"disable:{client_id}"
+                }
+            ],
+
+            [
+                {
+                    "text": "🤖 Bots",
+                    "callback_data":
+                        f"clientbots:{client_id}"
+                }
+            ],
+
+            [
+                {
+                    "text": "❌ Remove",
+                    "callback_data":
+                        f"remove:{client_id}"
+                }
+            ]
+
+        ]
     }
 
+    send_message(
+        chat_id,
+
+        f"""👤 CLIENT
+
+🆔 Chat ID: {client_id}
+📊 Status: {status.upper()}
+
+Select an action:""",
+
+        keyboard
+    )
+
 
 # ============================================================
-# TEXT SCREENS
+# BOT LIST
 # ============================================================
 
-def owner_panel_text():
-    lock = (
-        "🔒 LOCKED"
-        if get_global_lock()
-        else "🔓 UNLOCKED"
+def show_bots(chat_id, owner_id):
+
+    bots = get_client_bots(
+        owner_id
     )
 
-    bots = get_all_bots()
+    if not bots:
 
-    running = sum(
-        1
-        for b in bots
-        if process_alive(b[0])
+        send_message(
+            chat_id,
+            "🤖 No bots found."
+        )
+
+        return
+
+    text = (
+        f"🤖 {BRAND} BOTS\n\n"
     )
 
-    clients = len(get_clients())
+    keyboard = []
 
-    return (
-        f"🛠 {APP_NAME}\n\n"
-        f"👥 Clients: {clients}\n"
-        f"🤖 Bots: {len(bots)}\n"
-        f"🟢 Running: {running}\n"
-        f"🔐 Global Client Access: {lock}\n\n"
-        "Owner controls:"
+    for bot in bots:
+
+        bot_id = bot[0]
+        name = bot[1]
+        filename = bot[2]
+        status = bot[3]
+
+        icon = (
+            "🟢"
+            if process_alive(bot_id)
+            else "🔴"
+        )
+
+        text += (
+            f"{icon} #{bot_id} "
+            f"{name}\n"
+            f"   📄 {filename}\n"
+            f"   📊 {status}\n\n"
+        )
+
+        keyboard.append(
+            [
+                {
+                    "text":
+                        f"🤖 #{bot_id} {name}",
+                    "callback_data":
+                        f"bot:{bot_id}"
+                }
+            ]
+        )
+
+    send_message(
+        chat_id,
+        text,
+        {
+            "inline_keyboard":
+                keyboard
+        }
     )
 
 
-def client_panel_text(chat_id):
-    bots = get_client_bots(chat_id)
+# ============================================================
+# BOT MANAGEMENT
+# ============================================================
 
-    running = sum(
-        1
-        for b in bots
-        if process_alive(b[0])
+def bot_management(chat_id, bot_id):
+
+    bot = get_bot(bot_id)
+
+    if not bot:
+
+        send_message(
+            chat_id,
+            "❌ Bot not found."
+        )
+
+        return
+
+    owner_id = int(bot[1])
+
+    if not is_owner(chat_id):
+
+        if int(chat_id) != owner_id:
+
+            send_message(
+                chat_id,
+                "🚫 Access denied."
+            )
+
+            return
+
+    running = process_alive(
+        bot_id
     )
-
-    return (
-        f"🤖 {APP_NAME}\n\n"
-        f"Your bots: {len(bots)}\n"
-        f"Running: {running}\n\n"
-        "Upload one .py file to create a bot."
-    )
-
-
-def bot_text(bot):
-    running = process_alive(bot[0])
 
     status = (
         "🟢 RUNNING"
         if running
-        else f"🔴 {bot[5].upper()}"
-    )
-
-    return (
-        f"🤖 {bot[2]}\n\n"
-        f"🆔 Bot ID: {bot[0]}\n"
-        f"👤 Owner ID: {bot[1]}\n"
-        f"📄 File: {bot[3]}\n"
-        f"📊 Status: {status}\n"
-        f"🔄 Auto Restart: "
-        f"{'ON' if bot[6] else 'OFF'}"
-    )
-
-
-# ============================================================
-# OWNER SCREENS
-# ============================================================
-
-def show_clients(chat_id, message_id=None):
-    clients = get_clients()
-
-    rows = []
-
-    for client in clients:
-
-        cid = client[0]
-
-        label = (
-            f"@{client[1]}"
-            if client[1]
-            else client[2] or "Client"
-        )
-
-        if client[4] != "enabled":
-            label = "🚫 " + label
-
-        rows.append([
-            {
-                "text": label[:40],
-                "callback_data":
-                    f"client:{cid}"
-            }
-        ])
-
-    rows.append([
-        {
-            "text": "⬅️ Owner Panel",
-            "callback_data": "owner:panel"
-        }
-    ])
-
-    text = (
-        f"👥 CLIENTS\n\n"
-        f"Total: {len(clients)}\n\n"
-        "Select a client:"
+        else "🔴 STOPPED"
     )
 
     keyboard = {
-        "inline_keyboard": rows
-    }
+        "inline_keyboard": [
 
-    if message_id:
-        edit_message(
-            chat_id,
-            message_id,
-            text,
-            keyboard
-        )
-    else:
-        send_message(
-            chat_id,
-            text,
-            keyboard
-        )
-
-
-def show_client(chat_id, client_id, message_id=None):
-    client = get_client(client_id)
-
-    if not client:
-        text = "❌ Client not found."
-        keyboard = {
-            "inline_keyboard": [[
-                {
-                    "text": "⬅️ Back",
-                    "callback_data":
-                        "owner:clients"
-                }
-            ]]
-        }
-
-    else:
-        bots = get_client_bots(client_id)
-
-        label = client_display(client)
-
-        status = (
-            "🟢 Enabled"
-            if client[4] == "enabled"
-            else "🔴 Disabled"
-        )
-
-        text = (
-            f"👤 CLIENT\n\n"
-            f"{label}\n"
-            f"📊 Access: {status}\n"
-            f"🤖 Bots: {len(bots)}\n"
-        )
-
-        rows = []
-
-        for bot in bots:
-            rows.append([
-                {
-                    "text":
-                        f"🤖 {bot[2]} "
-                        f"({'🟢' if process_alive(bot[0]) else '🔴'})",
-                    "callback_data":
-                        f"bot:{bot[0]}"
-                }
-            ])
-
-        rows += [
             [
                 {
-                    "text": (
-                        "🚫 Disable Client"
-                        if client[4] == "enabled"
-                        else "🟢 Enable Client"
-                    ),
+                    "text": "▶️ Run",
                     "callback_data":
-                        f"clienttoggle:{client_id}"
+                        f"run:{bot_id}"
+                },
+                {
+                    "text": "🛑 Stop",
+                    "callback_data":
+                        f"stop:{bot_id}"
                 }
             ],
+
             [
                 {
-                    "text": "🗑 Delete Client",
+                    "text": "🔄 Restart",
                     "callback_data":
-                        f"clientdelete:{client_id}"
+                        f"restart:{bot_id}"
                 }
             ],
+
             [
                 {
-                    "text": "⬅️ Clients",
+                    "text": "📜 Logs",
                     "callback_data":
-                        "owner:clients"
+                        f"logs:{bot_id}"
                 }
             ]
+
         ]
-
-        keyboard = {
-            "inline_keyboard": rows
-        }
-
-    if message_id:
-        edit_message(
-            chat_id,
-            message_id,
-            text,
-            keyboard
-        )
-    else:
-        send_message(
-            chat_id,
-            text,
-            keyboard
-        )
-
-
-def show_all_bots(chat_id, message_id=None):
-    bots = get_all_bots()
-
-    rows = []
-
-    for bot in bots:
-
-        rows.append([
-            {
-                "text":
-                    f"#{bot[0]} {bot[2]} "
-                    f"({'🟢' if process_alive(bot[0]) else '🔴'})",
-                "callback_data":
-                    f"bot:{bot[0]}"
-            }
-        ])
-
-    rows.append([
-        {
-            "text": "⬅️ Owner Panel",
-            "callback_data": "owner:panel"
-        }
-    ])
-
-    keyboard = {
-        "inline_keyboard": rows
     }
-
-    text = (
-        f"🤖 ALL BOTS\n\n"
-        f"Total: {len(bots)}"
-    )
-
-    if message_id:
-        edit_message(
-            chat_id,
-            message_id,
-            text,
-            keyboard
-        )
-    else:
-        send_message(
-            chat_id,
-            text,
-            keyboard
-        )
-
-
-def show_my_bots(chat_id, message_id=None):
-    bots = get_client_bots(chat_id)
-
-    rows = []
-
-    for bot in bots:
-
-        rows.append([
-            {
-                "text":
-                    f"{bot[2]} "
-                    f"({'🟢' if process_alive(bot[0]) else '🔴'})",
-                "callback_data":
-                    f"mybot:{bot[0]}"
-            }
-        ])
-
-    text = (
-        "🤖 MY BOTS\n\n"
-        f"Total: {len(bots)}"
-    )
-
-    rows.append([
-        {
-            "text": "⬅️ Back",
-            "callback_data": "my:panel"
-        }
-    ])
-
-    keyboard = {
-        "inline_keyboard": rows
-    }
-
-    if message_id:
-        edit_message(
-            chat_id,
-            message_id,
-            text,
-            keyboard
-        )
-    else:
-        send_message(
-            chat_id,
-            text,
-            keyboard
-        )
-
-
-def show_access(chat_id):
-    clients = get_clients()
-
-    rows = []
-
-    for client in clients:
-
-        cid = client[0]
-
-        label = (
-            f"@{client[1]}"
-            if client[1]
-            else str(cid)
-        )
-
-        rows.append([
-            {
-                "text":
-                    f"{'🟢' if client[4] == 'enabled' else '🔴'} {label}",
-                "callback_data":
-                    f"clienttoggle:{cid}"
-            }
-        ])
-
-    rows.append([
-        {
-            "text": "⬅️ Owner Panel",
-            "callback_data": "owner:panel"
-        }
-    ])
 
     send_message(
         chat_id,
-        "🔐 HOSTING ACCESS\n\n"
-        "Tap a client to enable/disable access.",
+
+        f"""🤖 BOT CONTROL
+
+🆔 Bot ID: {bot_id}
+📛 Name: {bot[2]}
+📄 File: {bot[3]}
+
+📊 Status: {status}
+
+👤 Owner: {owner_id}
+
+🔁 Auto Restart:
+{'ON' if bot[6] else 'OFF'}""",
+
+        keyboard
+    )
+
+
+# ============================================================
+# LOG VIEW
+# ============================================================
+
+def send_logs(chat_id, bot_id):
+
+    bot = get_bot(bot_id)
+
+    if not bot:
+
+        send_message(
+            chat_id,
+            "❌ Bot not found."
+        )
+
+        return
+
+    owner_id = int(bot[1])
+
+    if not is_owner(chat_id):
+
+        if int(chat_id) != owner_id:
+
+            send_message(
+                chat_id,
+                "🚫 Access denied."
+            )
+
+            return
+
+    path = log_file(bot_id)
+
+    if not path or not path.exists():
+
+        send_message(
+            chat_id,
+            "📜 No logs available."
+        )
+
+        return
+
+    try:
+
+        content = path.read_text(
+            encoding="utf-8",
+            errors="replace"
+        )
+
+        if len(content) > 3500:
+
+            content = content[-3500:]
+
+        send_message(
+            chat_id,
+            "📜 LOGS\n\n"
+            + content
+        )
+
+    except Exception as e:
+
+        send_message(
+            chat_id,
+            f"❌ Log error:\n{e}"
+        )
+
+
+# ============================================================
+# DOCUMENT UPLOAD
+# ============================================================
+
+def download_document(message, owner_id):
+
+    document = message.get(
+        "document"
+    )
+
+    if not document:
+
+        return
+
+    filename = safe_filename(
+        document.get(
+            "file_name",
+            "bot.py"
+        )
+    )
+
+    if not filename.lower().endswith(
+        ".py"
+    ):
+
+        send_message(
+            owner_id,
+            "❌ Sirf `.py` files upload karo."
+        )
+
+        return
+
+    file_id = document["file_id"]
+
+    result = api(
+        "getFile",
         {
-            "inline_keyboard": rows
+            "file_id": file_id
         }
     )
 
-
-# ============================================================
-# UPLOAD
-# ============================================================
-
-def download_document(document):
-    file_id = document.get("file_id")
-
-    name = document.get(
-        "file_name",
-        "bot.py"
-    )
-
-    name = safe_filename(name)
-
-    if not name:
-        raise ValueError(
-            "❌ Only safe .py files are allowed."
-        )
-
-    size = int(
-        document.get(
-            "file_size",
-            0
-        ) or 0
-    )
-
-    if size > MAX_UPLOAD_SIZE:
-        raise ValueError(
-            "❌ File too large. Maximum is 2 MB."
-        )
-
-    result = telegram(
-        "getFile",
-        {"file_id": file_id}
-    )
-
     if not result.get("ok"):
-        raise RuntimeError(
-            "Unable to get Telegram file."
+
+        send_message(
+            owner_id,
+            "❌ Telegram file information nahi mil saki."
         )
 
-    file_path = result["result"]["file_path"]
+        return
 
-    url = (
-        f"https://api.telegram.org/file/bot"
-        f"{BOT_TOKEN}/{file_path}"
-    )
+    telegram_path = result[
+        "result"
+    ]["file_path"]
 
-    response = session.get(
-        url,
-        timeout=60
-    )
+    try:
 
-    if response.status_code != 200:
-        raise RuntimeError(
-            "File download failed."
+        response = session.get(
+            f"https://api.telegram.org/file/bot{BOT_TOKEN}/{telegram_path}",
+            timeout=60
         )
 
-    content = response.content
+        if response.status_code != 200:
 
-    if len(content) > MAX_UPLOAD_SIZE:
-        raise ValueError(
-            "❌ File too large. Maximum is 2 MB."
+            send_message(
+                owner_id,
+                "❌ File download failed."
+            )
+
+            return
+
+        name_without_ext = Path(
+            filename
+        ).stem
+
+        bot_id = create_bot(
+            owner_id,
+            name_without_ext,
+            filename
         )
 
-    return name, content
+        bot = get_bot(
+            bot_id
+        )
+
+        folder = Path(
+            bot[4]
+        )
+
+        target = folder / filename
+
+        target.write_bytes(
+            response.content
+        )
+
+        send_message(
+            owner_id,
+
+            f"""✅ BOT UPLOADED
+
+🏷️ {BRAND}
+
+🤖 Bot ID: {bot_id}
+📛 Name: {name_without_ext}
+📄 File: {filename}
+
+📁 Client data:
+{folder}
+
+Now you can ▶️ Run the bot.""",
+
+            {
+                "inline_keyboard": [
+                    [
+                        {
+                            "text": "▶️ Run Now",
+                            "callback_data":
+                                f"run:{bot_id}"
+                        }
+                    ],
+                    [
+                        {
+                            "text": "🤖 Bot Control",
+                            "callback_data":
+                                f"bot:{bot_id}"
+                        }
+                    ]
+                ]
+            }
+        )
+
+    except Exception as e:
+
+        send_message(
+            owner_id,
+            f"❌ Upload error:\n{e}"
+        )
 
 
 # ============================================================
-# CALLBACK HANDLING
+# CALLBACK HANDLER
 # ============================================================
-
-def callback_allowed(chat_id):
-    if is_owner(chat_id):
-        return True
-
-    return authorized(chat_id)
-
 
 def handle_callback(callback):
+
     callback_id = callback["id"]
+
+    answer_callback(
+        callback_id
+    )
 
     message = callback.get(
         "message",
@@ -1852,752 +1444,876 @@ def handle_callback(callback):
         {}
     )
 
-    chat_id = chat.get("id")
-
-    if not chat_id:
-        return
+    chat_id = chat.get(
+        "id"
+    )
 
     data = callback.get(
         "data",
         ""
     )
 
-    message_id = message.get(
-        "message_id"
-    )
+    # -----------------------------------------
+    # GLOBAL AUTH CHECK
+    # -----------------------------------------
 
-    if not rate_ok(chat_id, "callback"):
-        answer_callback(
-            callback_id,
-            "Too many requests."
-        )
-        return
+    if not authorized(chat_id):
 
-    if not callback_allowed(chat_id):
-        answer_callback(
-            callback_id,
-            "🔒 Hosting access is locked."
-        )
-        return
-
-    answer_callback(
-        callback_id
-    )
-
-    # --------------------------------------------------------
-    # Owner panel
-    # --------------------------------------------------------
-
-    if data == "owner:panel":
-
-        if not is_owner(chat_id):
-            return
-
-        edit_message(
+        send_message(
             chat_id,
-            message_id,
-            owner_panel_text(),
-            owner_panel_keyboard()
+
+            f"""🚫 ACCESS DENIED
+
+{BRAND}
+
+Your Chat ID is not authorized.
+
+🆔 {chat_id}
+
+Please contact the owner."""
         )
 
         return
 
-    if data == "owner:clients":
+    # -----------------------------------------
+    # OWNER MENU
+    # -----------------------------------------
+
+    if data == "clients":
 
         if not is_owner(chat_id):
             return
 
         show_clients(
-            chat_id,
-            message_id
+            chat_id
         )
 
         return
 
-    if data == "owner:bots":
+
+    if data == "addclient":
 
         if not is_owner(chat_id):
             return
 
-        show_all_bots(
+        user_states[
+            chat_id
+        ] = "add_client"
+
+        send_message(
             chat_id,
-            message_id
+
+            """➕ ADD CLIENT
+
+Send the client's Telegram Chat ID.
+
+Example:
+
+123456789
+
+Send /cancel to cancel."""
         )
 
         return
 
-    if data == "owner:stopall":
+
+    if data == "hoststatus":
 
         if not is_owner(chat_id):
             return
 
-        count = stop_all_bots()
+        running = 0
+        total = 0
 
-        edit_message(
-            chat_id,
-            message_id,
-            f"🛑 STOP ALL COMPLETE\n\n"
-            f"Stopped bots: {count}",
-            owner_panel_keyboard()
+        with db_lock:
+
+            total = db.execute(
+                "SELECT COUNT(*) FROM bots"
+            ).fetchone()[0]
+
+        with process_lock:
+
+            running = sum(
+                1
+                for p in processes.values()
+                if p.poll() is None
+            )
+
+        uptime = int(
+            time.time() - START_TIME
         )
 
-        audit(
+        send_message(
             chat_id,
-            "stop_all",
-            count
+
+            f"""📊 {BRAND} HOST STATUS
+
+🤖 Total Bots: {total}
+🟢 Running: {running}
+🔴 Stopped: {total - running}
+
+👥 Clients:
+{len(get_clients())}
+
+⏱️ Host Uptime:
+{uptime} seconds"""
         )
 
         return
 
-    if data == "owner:lock":
+
+    if data == "allbots":
 
         if not is_owner(chat_id):
             return
 
-        set_global_lock(True)
+        bots_text = "📊 ALL BOTS\n\n"
 
-        edit_message(
-            chat_id,
-            message_id,
-            owner_panel_text(),
-            owner_panel_keyboard()
-        )
+        with db_lock:
 
-        audit(
+            rows = db.execute(
+                """
+                SELECT id, owner_id, name, status
+                FROM bots
+                ORDER BY id
+                """
+            ).fetchall()
+
+        if not rows:
+
+            bots_text += "No bots."
+
+        else:
+
+            for row in rows:
+
+                bots_text += (
+                    f"#{row[0]} "
+                    f"{row[2]}\n"
+                    f"👤 Owner: {row[1]}\n"
+                    f"📊 {row[3]}\n\n"
+                )
+
+        send_message(
             chat_id,
-            "global_lock",
-            "on"
+            bots_text
         )
 
         return
 
-    if data == "owner:unlock":
+
+    if data == "runall":
 
         if not is_owner(chat_id):
             return
 
-        set_global_lock(False)
+        with db_lock:
 
-        edit_message(
-            chat_id,
-            message_id,
-            owner_panel_text(),
-            owner_panel_keyboard()
-        )
+            rows = db.execute(
+                "SELECT id FROM bots"
+            ).fetchall()
 
-        audit(
+        started = 0
+
+        for row in rows:
+
+            ok, _ = start_bot(
+                row[0]
+            )
+
+            if ok:
+                started += 1
+
+        send_message(
             chat_id,
-            "global_lock",
-            "off"
+            f"▶️ Run All complete.\n\nStarted: {started}"
         )
 
         return
 
-    if data == "owner:access":
 
-        if is_owner(chat_id):
-            show_access(chat_id)
+    if data == "stopall":
+
+        if not is_owner(chat_id):
+            return
+
+        with db_lock:
+
+            rows = db.execute(
+                "SELECT id FROM bots"
+            ).fetchall()
+
+        stopped = 0
+
+        for row in rows:
+
+            ok, _ = stop_bot(
+                row[0]
+            )
+
+            if ok:
+                stopped += 1
+
+        send_message(
+            chat_id,
+            f"🛑 Stop All complete.\n\nStopped: {stopped}"
+        )
 
         return
 
-    # --------------------------------------------------------
-    # Client
-    # --------------------------------------------------------
+
+    if data == "restartall":
+
+        if not is_owner(chat_id):
+            return
+
+        with db_lock:
+
+            rows = db.execute(
+                "SELECT id FROM bots"
+            ).fetchall()
+
+        restarted = 0
+
+        for row in rows:
+
+            ok, _ = restart_bot(
+                row[0]
+            )
+
+            if ok:
+                restarted += 1
+
+        send_message(
+            chat_id,
+            f"🔄 Restart All complete.\n\nRestarted: {restarted}"
+        )
+
+        return
+
+
+    # -----------------------------------------
+    # CLIENT MANAGEMENT
+    # -----------------------------------------
 
     if data.startswith("client:"):
 
         if not is_owner(chat_id):
             return
 
-        try:
-            client_id = int(
-                data.split(":")[1]
-            )
-        except Exception:
-            return
+        cid = int(
+            data.split(":")[1]
+        )
 
-        show_client(
+        client_management(
             chat_id,
-            client_id,
-            message_id
+            cid
         )
 
         return
 
-    if data.startswith("clienttoggle:"):
+
+    if data.startswith("enable:"):
 
         if not is_owner(chat_id):
             return
 
-        try:
-            client_id = int(
-                data.split(":")[1]
-            )
-        except Exception:
-            return
-
-        client = get_client(client_id)
-
-        if not client:
-            return
-
-        new_status = (
-            "disabled"
-            if client[4] == "enabled"
-            else "enabled"
+        cid = int(
+            data.split(":")[1]
         )
 
         set_client_status(
-            client_id,
-            new_status
+            cid,
+            "enabled"
         )
 
-        show_client(
+        send_message(
             chat_id,
-            client_id,
-            message_id
+            f"✅ Client {cid} ENABLED."
         )
 
         return
 
-    if data.startswith("clientdelete:"):
+
+    if data.startswith("disable:"):
 
         if not is_owner(chat_id):
             return
 
-        try:
-            client_id = int(
-                data.split(":")[1]
-            )
-        except Exception:
-            return
-
-        if client_id == chat_id:
-            return
-
-        user_states[chat_id] = {
-            "type": "confirm_client_delete",
-            "client_id": client_id
-        }
-
-        edit_message(
-            chat_id,
-            message_id,
-            "⚠️ PERMANENT DELETE\n\n"
-            "This will permanently delete:\n"
-            "• Client record\n"
-            "• All bots\n"
-            "• Python files\n"
-            "• .venv folders\n"
-            "• Logs\n\n"
-            "This action cannot be undone.\n\n"
-            "Type CONFIRM to continue.",
-            {
-                "inline_keyboard": [[
-                    {
-                        "text": "❌ Cancel",
-                        "callback_data":
-                            f"client:{client_id}"
-                    }
-                ]]
-            }
+        cid = int(
+            data.split(":")[1]
         )
 
-        return
-
-    # --------------------------------------------------------
-    # Bot screens
-    # --------------------------------------------------------
-
-    if data.startswith("bot:"):
-
-        parts = data.split(":")
-
-        if len(parts) == 2:
-
-            try:
-                bot_id = int(parts[1])
-            except Exception:
-                return
-
-            bot = get_bot(bot_id)
-
-            if not bot:
-                return
-
-            if not control_allowed(
-                chat_id,
-                bot
-            ):
-                return
-
-            edit_message(
-                chat_id,
-                message_id,
-                bot_text(bot),
-                bot_keyboard(
-                    bot_id,
-                    owner=is_owner(chat_id)
-                )
-            )
-
-            return
-
-        action = parts[1]
-
-        try:
-            bot_id = int(parts[2])
-        except Exception:
-            return
-
-        bot = get_bot(bot_id)
-
-        if not bot:
-            return
-
-        if not control_allowed(
-            chat_id,
-            bot
-        ):
-            return
-
-        if action == "start":
-            ok, text = start_bot(bot_id)
-
-        elif action == "stop":
-            ok = stop_bot(
-                bot_id,
-                intentional=True
-            )
-            text = (
-                "⏹ Bot stopped."
-                if ok
-                else "Bot not found."
-            )
-
-        elif action == "restart":
-            ok, text = restart_bot(
-                bot_id
-            )
-
-        elif action == "logs":
-            logs = read_logs(bot_id)
-
-            send_message(
-                chat_id,
-                f"📜 LOGS — Bot #{bot_id}\n\n"
-                f"{logs[-MAX_LOG_SIZE:]}"
-            )
-
-            return
-
-        elif action == "delete":
-
-            user_states[chat_id] = {
-                "type": "confirm_bot_delete",
-                "bot_id": bot_id
-            }
-
-            edit_message(
-                chat_id,
-                message_id,
-                "⚠️ PERMANENT BOT DELETE\n\n"
-                "The bot file, .venv and logs "
-                "will be permanently deleted.\n\n"
-                "Type CONFIRM to continue.",
-                {
-                    "inline_keyboard": [[
-                        {
-                            "text": "❌ Cancel",
-                            "callback_data":
-                                f"bot:{bot_id}"
-                        }
-                    ]]
-                }
-            )
-
-            return
-
-        else:
-            return
-
-        bot = get_bot(bot_id)
-
-        edit_message(
-            chat_id,
-            message_id,
-            (
-                (text + "\n\n" if text else "")
-                + bot_text(bot)
-            ),
-            bot_keyboard(
-                bot_id,
-                owner=is_owner(chat_id)
-            )
+        set_client_status(
+            cid,
+            "disabled"
         )
 
-        return
-
-    # --------------------------------------------------------
-    # My bots
-    # --------------------------------------------------------
-
-    if data == "my:panel":
-
-        if not authorized(chat_id):
-            return
-
-        edit_message(
-            chat_id,
-            message_id,
-            client_panel_text(chat_id),
-            client_panel_keyboard()
+        stop_all_bots(
+            cid
         )
-
-        return
-
-    if data == "my:bots":
-
-        show_my_bots(
-            chat_id,
-            message_id
-        )
-
-        return
-
-    if data == "my:status":
 
         send_message(
             chat_id,
-            client_panel_text(chat_id)
+
+            f"""🚫 Client disabled.
+
+🆔 {cid}
+
+All of this client's running bots
+have been stopped."""
         )
 
         return
 
-    if data.startswith("mybot:"):
 
-        try:
-            bot_id = int(
-                data.split(":")[1]
-            )
-        except Exception:
+    if data.startswith("remove:"):
+
+        if not is_owner(chat_id):
             return
 
-        bot = get_bot(bot_id)
+        cid = int(
+            data.split(":")[1]
+        )
+
+        remove_client(
+            cid
+        )
+
+        send_message(
+            chat_id,
+            f"❌ Client {cid} removed."
+        )
+
+        return
+
+
+    if data.startswith("clientbots:"):
+
+        if not is_owner(chat_id):
+            return
+
+        cid = int(
+            data.split(":")[1]
+        )
+
+        show_bots(
+            chat_id,
+            cid
+        )
+
+        return
+
+
+    # -----------------------------------------
+    # CLIENT BOT LIST
+    # -----------------------------------------
+
+    if data == "mybots":
+
+        show_bots(
+            chat_id,
+            chat_id
+        )
+
+        return
+
+
+    if data == "upload":
+
+        user_states[
+            chat_id
+        ] = "upload"
+
+        send_message(
+            chat_id,
+
+            f"""📤 {BRAND}
+
+BOT UPLOAD
+
+Send your Python `.py` file now.
+
+Example:
+mybot.py
+
+The bot will be stored inside
+your private client folder."""
+        )
+
+        return
+
+
+    if data == "myrunall":
+
+        bots = get_client_bots(
+            chat_id
+        )
+
+        count = 0
+
+        for bot in bots:
+
+            ok, _ = start_bot(
+                bot[0]
+            )
+
+            if ok:
+                count += 1
+
+        send_message(
+            chat_id,
+            f"▶️ Started {count} bot(s)."
+        )
+
+        return
+
+
+    if data == "mystopall":
+
+        stop_all_bots(
+            chat_id
+        )
+
+        send_message(
+            chat_id,
+            "🛑 All your bots stopped."
+        )
+
+        return
+
+
+    if data == "myrestartall":
+
+        results = restart_all_bots(
+            chat_id
+        )
+
+        send_message(
+            chat_id,
+            "🔄 Restart All\n\n"
+            + "\n".join(results)
+        )
+
+        return
+
+
+    # -----------------------------------------
+    # BOT CONTROL
+    # -----------------------------------------
+
+    if data.startswith("bot:"):
+
+        bot_id = int(
+            data.split(":")[1]
+        )
+
+        bot_management(
+            chat_id,
+            bot_id
+        )
+
+        return
+
+
+    if data.startswith("run:"):
+
+        bot_id = int(
+            data.split(":")[1]
+        )
+
+        bot = get_bot(
+            bot_id
+        )
 
         if not bot:
             return
 
-        if int(bot[1]) != int(chat_id):
-            return
+        if not is_owner(chat_id):
 
-        edit_message(
+            if int(bot[1]) != int(chat_id):
+                return
+
+        ok, msg = start_bot(
+            bot_id
+        )
+
+        send_message(
             chat_id,
-            message_id,
-            bot_text(bot),
-            bot_keyboard(
-                bot_id,
-                owner=False
-            )
+            ("✅ " if ok else "❌ ")
+            + msg
         )
 
         return
 
 
-def control_allowed(chat_id, bot):
-    return (
-        is_owner(chat_id)
-        or int(bot[1]) == int(chat_id)
-    )
+    if data.startswith("stop:"):
+
+        bot_id = int(
+            data.split(":")[1]
+        )
+
+        bot = get_bot(
+            bot_id
+        )
+
+        if not bot:
+            return
+
+        if not is_owner(chat_id):
+
+            if int(bot[1]) != int(chat_id):
+                return
+
+        ok, msg = stop_bot(
+            bot_id
+        )
+
+        send_message(
+            chat_id,
+            ("✅ " if ok else "❌ ")
+            + msg
+        )
+
+        return
+
+
+    if data.startswith("restart:"):
+
+        bot_id = int(
+            data.split(":")[1]
+        )
+
+        bot = get_bot(
+            bot_id
+        )
+
+        if not bot:
+            return
+
+        if not is_owner(chat_id):
+
+            if int(bot[1]) != int(chat_id):
+                return
+
+        ok, msg = restart_bot(
+            bot_id
+        )
+
+        send_message(
+            chat_id,
+            ("✅ " if ok else "❌ ")
+            + msg
+        )
+
+        return
+
+
+    if data.startswith("logs:"):
+
+        bot_id = int(
+            data.split(":")[1]
+        )
+
+        send_logs(
+            chat_id,
+            bot_id
+        )
+
+        return
 
 
 # ============================================================
-# MESSAGE HANDLING
+# MESSAGE HANDLER
 # ============================================================
 
 def handle_message(message):
-    chat = message.get(
-        "chat",
-        {}
+
+    chat_id = int(
+        message["chat"]["id"]
     )
-
-    chat_id = chat.get("id")
-
-    if not chat_id:
-        return
-
-    user = message.get(
-        "from",
-        chat
-    )
-
-    register_client(user)
 
     text = message.get(
         "text",
         ""
     )
 
-    # --------------------------------------------------------
-    # Confirmation
-    # --------------------------------------------------------
+    # -----------------------------------------
+    # DOCUMENT
+    # -----------------------------------------
 
-    if text.strip().upper() == "CONFIRM":
+    if "document" in message:
 
-        state = user_states.pop(
+        if not authorized(chat_id):
+
+            send_message(
+                chat_id,
+                f"🚫 {BRAND}\n\nAccess denied."
+            )
+
+            return
+
+        download_document(
+            message,
+            chat_id
+        )
+
+        return
+
+
+    # -----------------------------------------
+    # CANCEL
+    # -----------------------------------------
+
+    if text == "/cancel":
+
+        user_states.pop(
             chat_id,
             None
         )
 
-        if state:
+        send_message(
+            chat_id,
+            "❌ Current operation cancelled."
+        )
 
-            if state["type"] == "confirm_bot_delete":
+        return
 
-                bot_id = state["bot_id"]
 
-                bot = get_bot(bot_id)
-
-                if bot and control_allowed(
-                    chat_id,
-                    bot
-                ):
-                    delete_bot(bot_id)
-
-                    send_message(
-                        chat_id,
-                        "🗑 Bot permanently deleted."
-                    )
-
-                return
-
-            if state["type"] == "confirm_client_delete":
-
-                if not is_owner(chat_id):
-                    return
-
-                client_id = state["client_id"]
-
-                if delete_client(client_id):
-
-                    send_message(
-                        chat_id,
-                        "🗑 Client and all data "
-                        "permanently deleted."
-                    )
-
-                return
-
-    # --------------------------------------------------------
-    # Commands
-    # --------------------------------------------------------
+    # -----------------------------------------
+    # START
+    # -----------------------------------------
 
     if text.startswith("/start"):
 
         if is_owner(chat_id):
 
-            send_message(
-                chat_id,
-                owner_panel_text(),
-                owner_panel_keyboard()
+            show_owner(
+                chat_id
             )
 
-        elif authorized(chat_id):
+            return
+
+        if client_enabled(chat_id):
+
+            show_client(
+                chat_id
+            )
+
+            return
+
+        send_message(
+            chat_id,
+
+            f"""🚫 ACCESS DENIED
+
+{BRAND}
+
+Your Chat ID is not authorized.
+
+🆔 {chat_id}
+
+Contact the owner for access."""
+        )
+
+        return
+
+
+    # -----------------------------------------
+    # OWNER ADD CLIENT STATE
+    # -----------------------------------------
+
+    if user_states.get(chat_id) == "add_client":
+
+        if not is_owner(chat_id):
+            return
+
+        if text.isdigit():
+
+            client_id = int(
+                text
+            )
+
+            if client_id == OWNER_CHAT_ID:
+
+                send_message(
+                    chat_id,
+                    "❌ Owner ko client ke roop mein add karne ki zarurat nahi."
+                )
+
+                return
+
+            add_client(
+                client_id
+            )
+
+            user_states.pop(
+                chat_id,
+                None
+            )
 
             send_message(
                 chat_id,
-                client_panel_text(chat_id),
-                client_panel_keyboard()
+
+                f"""✅ CLIENT ADDED
+
+🆔 Chat ID: {client_id}
+📊 Status: ENABLED
+
+The client can now access
+{BRAND}."""
             )
 
         else:
 
             send_message(
                 chat_id,
-                "🔒 Hosting access is currently locked.\n\n"
-                "Please contact the owner."
+                "❌ Invalid Chat ID.\n\nOnly numbers allowed."
+
             )
 
         return
+
+
+    # -----------------------------------------
+    # NORMAL AUTH
+    # -----------------------------------------
+
+    if not authorized(chat_id):
+
+        send_message(
+            chat_id,
+
+            f"""🚫 ACCESS DENIED
+
+{BRAND}
+
+You are not an authorized client.
+
+🆔 Chat ID: {chat_id}"""
+        )
+
+        return
+
+
+    # -----------------------------------------
+    # COMMANDS
+    # -----------------------------------------
 
     if text == "/panel":
 
         if is_owner(chat_id):
 
-            send_message(
-                chat_id,
-                owner_panel_text(),
-                owner_panel_keyboard()
+            show_owner(
+                chat_id
             )
 
-        elif authorized(chat_id):
+        else:
 
-            send_message(
-                chat_id,
-                client_panel_text(chat_id),
-                client_panel_keyboard()
+            show_client(
+                chat_id
             )
 
         return
 
-    if text == "/clients" and is_owner(chat_id):
 
-        show_clients(chat_id)
+    if text == "/clients":
+
+        if is_owner(chat_id):
+
+            show_clients(
+                chat_id
+            )
+
         return
 
-    if text == "/bots" and is_owner(chat_id):
 
-        show_all_bots(chat_id)
-        return
+    if text == "/bots":
 
-    if text == "/stopall" and is_owner(chat_id):
-
-        count = stop_all_bots()
-
-        send_message(
+        show_bots(
             chat_id,
-            f"🛑 Stopped {count} bots."
+            chat_id
         )
 
         return
+
 
     if text == "/status":
 
-        if not authorized(chat_id):
-            return
-
-        bots = (
-            get_all_bots()
-            if is_owner(chat_id)
-            else get_client_bots(chat_id)
+        bots = get_client_bots(
+            chat_id
         )
 
         running = sum(
-            process_alive(b[0])
-            for b in bots
+            1
+            for bot in bots
+            if process_alive(bot[0])
         )
 
         send_message(
             chat_id,
-            f"📊 STATUS\n\n"
-            f"🤖 Bots: {len(bots)}\n"
-            f"🟢 Running: {running}\n"
-            f"⏱ Host uptime: "
-            f"{int(time.time() - START_TIME)} sec"
+
+            f"""📊 YOUR STATUS
+
+👤 Client ID: {chat_id}
+
+🤖 Total Bots: {len(bots)}
+🟢 Running: {running}
+🔴 Stopped: {len(bots) - running}
+
+🏷️ {BRAND}"""
         )
 
         return
 
-    if text == "/help":
 
-        send_message(
-            chat_id,
-            "🛠 KRUTIK CYBER EXPERT\n\n"
-            "/start - Panel\n"
-            "/panel - Panel\n"
-            "/status - Status\n"
-            "/help - Help\n\n"
-            "Send one .py file to create a bot."
-        )
+# ============================================================
+# POLLING
+# ============================================================
 
-        return
+def polling():
 
-    # --------------------------------------------------------
-    # Document upload
-    # --------------------------------------------------------
-
-    document = message.get(
-        "document"
+    print(
+        f"🚀 {BRAND} HOST STARTING..."
     )
 
-    if document:
+    result = api(
+        "getMe"
+    )
 
-        if not authorized(chat_id):
+    if not result.get("ok"):
 
-            send_message(
-                chat_id,
-                "🔒 Hosting access is locked."
-            )
-
-            return
-
-        if not rate_ok(
-            chat_id,
-            "upload"
-        ):
-
-            send_message(
-                chat_id,
-                "⏳ Too many uploads. Try later."
-            )
-
-            return
-
-        filename = document.get(
-            "file_name",
-            ""
+        print(
+            "❌ Telegram API error:"
         )
 
-        if not filename.lower().endswith(".py"):
-
-            send_message(
-                chat_id,
-                "❌ Only one .py file is allowed."
-            )
-
-            return
-
-        try:
-
-            filename, content = download_document(
-                document
-            )
-
-            stem = Path(
-                filename
-            ).stem
-
-            bot_id = create_bot(
-                chat_id,
-                stem,
-                filename,
-                content
-            )
-
-            send_message(
-                chat_id,
-                f"✅ Bot created successfully.\n\n"
-                f"🤖 Name: {stem}\n"
-                f"🆔 Bot ID: {bot_id}\n"
-                f"📄 File: {filename}\n\n"
-                "Use the button below.",
-                {
-                    "inline_keyboard": [[
-                        {
-                            "text": "🤖 Open Bot",
-                            "callback_data":
-                                f"mybot:{bot_id}"
-                        }
-                    ]]
-                }
-            )
-
-        except Exception as e:
-
-            send_message(
-                chat_id,
-                "❌ Upload failed:\n\n"
-                + str(e)
-            )
+        print(
+            result
+        )
 
         return
 
+    bot_username = result[
+        "result"
+    ].get(
+        "username"
+    )
 
-# ============================================================
-# TELEGRAM POLLING
-# ============================================================
+    print(
+        f"🤖 @{bot_username}"
+    )
 
-def polling_loop():
-    print("🤖 Telegram polling started")
+    print(
+        "🟢 Telegram API: OK"
+    )
+
+    api(
+        "deleteWebhook",
+        {
+            "drop_pending_updates":
+                "true"
+        }
+    )
 
     offset = None
 
@@ -2606,233 +2322,92 @@ def polling_loop():
         try:
 
             data = {
-                "timeout": 30,
-                "allowed_updates": json.dumps([
-                    "message",
-                    "callback_query"
-                ])
+                "timeout": 8,
+                "limit": 50,
+                "allowed_updates":
+                    json.dumps(
+                        [
+                            "message",
+                            "callback_query"
+                        ]
+                    )
             }
 
             if offset is not None:
-                data["offset"] = offset
 
-            result = telegram(
+                data[
+                    "offset"
+                ] = offset
+
+            result = api(
                 "getUpdates",
                 data,
-                timeout=40
+                timeout=12
             )
 
             if not result.get("ok"):
 
                 print(
-                    "getUpdates failed:",
+                    "⚠️ Telegram error:",
                     result
                 )
 
-                time.sleep(3)
+                time.sleep(1)
+
                 continue
 
-            updates = result.get(
+            for update in result.get(
                 "result",
                 []
-            )
-
-            for update in updates:
+            ):
 
                 offset = (
-                    update["update_id"] + 1
+                    update[
+                        "update_id"
+                    ] + 1
                 )
 
                 try:
 
-                    if "callback_query" in update:
-                        handle_callback(
-                            update["callback_query"]
+                    if "message" in update:
+
+                        handle_message(
+                            update[
+                                "message"
+                            ]
                         )
 
-                    elif "message" in update:
-                        handle_message(
-                            update["message"]
+                    elif "callback_query" in update:
+
+                        handle_callback(
+                            update[
+                                "callback_query"
+                            ]
                         )
 
                 except Exception as e:
 
                     print(
-                        "Update handling error:",
+                        "⚠️ Update error:",
                         repr(e)
                     )
+
+        except KeyboardInterrupt:
+
+            print(
+                "\n🛑 Host stopped."
+            )
+
+            break
 
         except Exception as e:
 
             print(
-                "Polling error:",
+                "🔄 Reconnecting:",
                 repr(e)
             )
 
-            time.sleep(3)
-
-
-# ============================================================
-# RENDER HEALTH SERVER
-# ============================================================
-
-class HealthHandler(BaseHTTPRequestHandler):
-
-    def do_GET(self):
-
-        if self.path.startswith("/health"):
-            body = (
-                f"{APP_NAME} OK\n"
-                f"uptime={int(time.time() - START_TIME)}\n"
-            ).encode()
-
-        else:
-            body = (
-                f"{APP_NAME} HOST RUNNING\n"
-            ).encode()
-
-        self.send_response(200)
-
-        self.send_header(
-            "Content-Type",
-            "text/plain; charset=utf-8"
-        )
-
-        self.send_header(
-            "Content-Length",
-            str(len(body))
-        )
-
-        self.end_headers()
-
-        self.wfile.write(body)
-
-    def do_HEAD(self):
-
-        body = b"OK"
-
-        self.send_response(200)
-
-        self.send_header(
-            "Content-Type",
-            "text/plain"
-        )
-
-        self.send_header(
-            "Content-Length",
-            str(len(body))
-        )
-
-        self.end_headers()
-
-    def log_message(
-        self,
-        format,
-        *args
-    ):
-        pass
-
-
-def start_health_server():
-
-    port = int(
-        os.getenv(
-            "PORT",
-            "10000"
-        )
-    )
-
-    server = ThreadingHTTPServer(
-        ("0.0.0.0", port),
-        HealthHandler
-    )
-
-    print(
-        f"🌐 Render health server "
-        f"listening on 0.0.0.0:{port}"
-    )
-
-    server.serve_forever()
-
-
-# ============================================================
-# RECOVER AUTO-RESTART BOTS
-# ============================================================
-
-def recover_bots():
-
-    bots = get_all_bots()
-
-    for bot in bots:
-
-        if bot[5] == "running":
-
-            update_bot_status(
-                bot[0],
-                "stopped"
-            )
-
-    for bot in bots:
-
-        if bot[6] == 1:
-
-            try:
-
-                if client_enabled(
-                    bot[1]
-                ):
-
-                    ok, text = start_bot(
-                        bot[0]
-                    )
-
-                    print(
-                        f"[RECOVERY] Bot {bot[0]}:",
-                        text
-                    )
-
-            except Exception as e:
-
-                print(
-                    f"[RECOVERY] Bot {bot[0]} failed:",
-                    e
-                )
-
-
-# ============================================================
-# VALIDATION
-# ============================================================
-
-def validate_environment():
-
-    if not BOT_TOKEN:
-
-        print(
-            "❌ BOT_TOKEN environment variable is missing."
-        )
-
-        return False
-
-    if not OWNER_CHAT_ID:
-
-        print(
-            "❌ OWNER_CHAT_ID environment variable is missing."
-        )
-
-        return False
-
-    try:
-        int(OWNER_CHAT_ID)
-
-    except ValueError:
-
-        print(
-            "❌ OWNER_CHAT_ID must be numeric."
-        )
-
-        return False
-
-    return True
+            time.sleep(1)
 
 
 # ============================================================
@@ -2841,69 +2416,741 @@ def validate_environment():
 
 def main():
 
-    print("=" * 60)
-    print(APP_NAME)
-    print("Multi-client Telegram Hosting Manager")
-    print("=" * 60)
+    if (
+        BOT_TOKEN
+        == "PUT_YOUR_HOST_BOT_TOKEN_HERE"
+    ):
+
+        print(
+            "❌ BOT_TOKEN set karo."
+        )
+
+        return
+
+    if (
+        not OWNER_CHAT_ID
+        or OWNER_CHAT_ID == 123456789
+    ):
+
+        print(
+            "❌ OWNER_CHAT_ID set karo."
+        )
+
+        return
 
     print(
-        "DATA_DIR:",
-        DATA_DIR
+        "=" * 60
     )
 
-    if not validate_environment():
-        sys.exit(1)
-
-    # IMPORTANT FOR RENDER:
-    # Start HTTP server immediately so Render
-    # detects an open port.
-    threading.Thread(
-        target=start_health_server,
-        daemon=True
-    ).start()
-
-    time.sleep(0.5)
-
-    # Test Telegram token
-    result = telegram(
-        "getMe",
-        timeout=15
+    print(
+        f"🔥 {BRAND}"
     )
 
-    if not result.get("ok"):
+    print(
+        "🚀 MULTI-CLIENT PYTHON HOST"
+    )
 
-        print(
-            "❌ Telegram BOT_TOKEN check failed."
-        )
+    print(
+        "=" * 60
+    )
 
-        print(result)
+    polling()
 
-        # Keep process alive so Render can still see
-        # the health endpoint while configuration is fixed.
-    else:
 
-        bot_info = result.get(
-            "result",
-            {}
-        )
 
-        print(
-            "✅ Telegram bot:",
-            bot_info.get("username")
-        )
+# ============================================================
+# FINAL ADDITIONS / COMPATIBILITY LAYER
+# Existing original panel/features are preserved; these are ADDITIONS.
+# ============================================================
 
-    # Recover bots only after Telegram/health
-    # infrastructure is started.
+# Render environment support
+BOT_TOKEN = os.getenv("BOT_TOKEN", BOT_TOKEN).strip()
+try:
+    OWNER_CHAT_ID = int(os.getenv("OWNER_CHAT_ID", str(OWNER_CHAT_ID)).strip())
+except Exception:
+    OWNER_CHAT_ID = 0
+
+DATA_DIR = Path(os.getenv("DATA_DIR", str(BASE_DIR / "host_data"))).resolve()
+CLIENTS_DIR = DATA_DIR / "clients"
+DB_FILE = DATA_DIR / "host.db"
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+CLIENTS_DIR.mkdir(parents=True, exist_ok=True)
+API = f"https://api.telegram.org/bot{BOT_TOKEN}"
+
+# Re-open SQLite at the configured DATA_DIR (the original file may have
+# been created before DATA_DIR was overridden).
+try:
+    db.close()
+except Exception:
+    pass
+db = sqlite3.connect(DB_FILE, check_same_thread=False, timeout=30)
+db.row_factory = sqlite3.Row
+db.execute("CREATE TABLE IF NOT EXISTS clients (chat_id INTEGER PRIMARY KEY, status TEXT NOT NULL DEFAULT 'enabled', added_at REAL NOT NULL)")
+db.execute("CREATE TABLE IF NOT EXISTS bots (id INTEGER PRIMARY KEY AUTOINCREMENT, owner_id INTEGER NOT NULL, name TEXT NOT NULL, filename TEXT NOT NULL, folder TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'stopped', auto_restart INTEGER NOT NULL DEFAULT 1, created_at REAL NOT NULL)")
+db.commit()
+
+# New persisted settings/columns. Existing database is migrated automatically.
+with db_lock:
     try:
-        recover_bots()
+        db.execute("ALTER TABLE clients ADD COLUMN username TEXT DEFAULT ''")
+    except Exception:
+        pass
+    try:
+        db.execute("ALTER TABLE clients ADD COLUMN first_name TEXT DEFAULT ''")
+    except Exception:
+        pass
+    try:
+        db.execute("ALTER TABLE clients ADD COLUMN last_name TEXT DEFAULT ''")
+    except Exception:
+        pass
+    try:
+        db.execute("ALTER TABLE clients ADD COLUMN notified INTEGER NOT NULL DEFAULT 0")
+    except Exception:
+        pass
+    try:
+        db.execute("ALTER TABLE bots ADD COLUMN desired_running INTEGER NOT NULL DEFAULT 0")
+    except Exception:
+        pass
+    db.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+    db.commit()
+
+
+def setting_get(key, default=""):
+    with db_lock:
+        row = db.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+    return row[0] if row else default
+
+
+def setting_set(key, value):
+    with db_lock:
+        db.execute("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, str(value)))
+        db.commit()
+
+
+def global_locked():
+    return setting_get("global_lock", "0") == "1"
+
+
+def set_global_lock(value):
+    setting_set("global_lock", "1" if value else "0")
+
+
+def control_allowed(chat_id, action=True):
+    if is_owner(chat_id):
+        return True
+    if global_locked():
+        send_message(chat_id, f"🔒 {BRAND}\n\nHosting is temporarily locked by the owner.\nPlease try again later.")
+        return False
+    if not client_enabled(chat_id):
+        send_message(chat_id, f"🚫 {BRAND}\n\nYour hosting access is disabled.\n\n🆔 {chat_id}")
+        return False
+    return True
+
+
+def update_client_profile(message):
+    user = message.get("from", {}) or {}
+    cid = int(message["chat"]["id"])
+    username = (user.get("username") or "").strip()
+    first_name = (user.get("first_name") or "").strip()
+    last_name = (user.get("last_name") or "").strip()
+    with db_lock:
+        db.execute("UPDATE clients SET username=?, first_name=?, last_name=? WHERE chat_id=?", (username, first_name, last_name, cid))
+        db.commit()
+
+
+def register_client_if_needed(message):
+    cid = int(message["chat"]["id"])
+    if is_owner(cid):
+        return False
+    user = message.get("from", {}) or {}
+    username = (user.get("username") or "").strip()
+    first_name = (user.get("first_name") or "").strip()
+    last_name = (user.get("last_name") or "").strip()
+    now = time.time()
+    is_new = False
+    with db_lock:
+        row = db.execute("SELECT chat_id, notified FROM clients WHERE chat_id=?", (cid,)).fetchone()
+        if row is None:
+            db.execute("INSERT INTO clients(chat_id,username,first_name,last_name,status,added_at,notified) VALUES(?,?,?,?,?,?,0)", (cid,username,first_name,last_name,"enabled",now))
+            db.commit()
+            is_new = True
+        else:
+            db.execute("UPDATE clients SET username=?, first_name=?, last_name=? WHERE chat_id=?", (username,first_name,last_name,cid))
+            db.commit()
+    client_folder(cid)
+    if is_new:
+        username_text = f"@{username}" if username else "(no username)"
+        name_text = " ".join(x for x in [first_name,last_name] if x).strip() or "(no name)"
+        send_message(OWNER_CHAT_ID, f"🆕 NEW CLIENT\n\n👤 Username: {username_text}\n📛 Name: {name_text}\n🆔 Chat ID: {cid}\n🕒 Time: {time.strftime('%Y-%m-%d %H:%M:%S')}", {"inline_keyboard":[[{"text":"👤 Open Client","callback_data":f"client:{cid}"}]]})
+        with db_lock:
+            db.execute("UPDATE clients SET notified=1 WHERE chat_id=?", (cid,))
+            db.commit()
+    return is_new
+
+
+def add_client(chat_id):
+    with db_lock:
+        db.execute("INSERT OR IGNORE INTO clients(chat_id,status,added_at,username,first_name,last_name,notified) VALUES(?, 'enabled', ?, '', '', '', 0)", (int(chat_id), time.time()))
+        db.commit()
+    client_folder(int(chat_id))
+
+
+def get_clients():
+    with db_lock:
+        return db.execute("SELECT chat_id, status, added_at, username, first_name, last_name FROM clients ORDER BY added_at").fetchall()
+
+
+def set_bot_desired(bot_id, value):
+    with db_lock:
+        db.execute("UPDATE bots SET desired_running=? WHERE id=?", (1 if value else 0, int(bot_id)))
+        db.commit()
+
+
+def get_bot(bot_id):
+    with db_lock:
+        row = db.execute("SELECT id,owner_id,name,filename,folder,status,auto_restart,desired_running FROM bots WHERE id=?", (int(bot_id),)).fetchone()
+    return row
+
+
+def get_client_bots(owner_id):
+    with db_lock:
+        return db.execute("SELECT id,name,filename,status,auto_restart,desired_running FROM bots WHERE owner_id=? ORDER BY id", (int(owner_id),)).fetchall()
+
+
+def _kill_process_tree(process):
+    if not process:
+        return
+    try:
+        if os.name == "posix":
+            try:
+                os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+            except Exception:
+                process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+                except Exception:
+                    process.kill()
+                try:
+                    process.wait(timeout=3)
+                except Exception:
+                    pass
+        else:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=3)
+    except Exception:
+        pass
+
+
+def _imports_for_script(script):
+    try:
+        tree = ast.parse(script.read_text(encoding="utf-8", errors="replace"), filename=str(script))
+    except Exception:
+        return set()
+    found=set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for a in node.names:
+                found.add(a.name.split('.')[0])
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            found.add(node.module.split('.')[0])
+    return found
+
+
+IMPORT_TO_PACKAGE = {
+    "telegram":"python-telegram-bot>=22,<23", "openai":"openai>=1.50,<2", "requests":"requests>=2.32,<3", "httpx":"httpx", "aiohttp":"aiohttp", "flask":"Flask", "fastapi":"fastapi", "uvicorn":"uvicorn", "bs4":"beautifulsoup4", "PIL":"Pillow", "cv2":"opencv-python", "dotenv":"python-dotenv", "yaml":"PyYAML", "Crypto":"pycryptodome", "numpy":"numpy", "pandas":"pandas", "qrcode":"qrcode", "schedule":"schedule", "rich":"rich", "colorama":"colorama", "selenium":"selenium", "jwt":"PyJWT", "google":"google-api-python-client", "discord":"discord.py", "psutil":"psutil"
+}
+try:
+    STDLIB = set(sys.stdlib_module_names)
+except Exception:
+    STDLIB = set()
+
+
+def _venv_python(folder):
+    return folder / ".venv" / ("Scripts" if os.name == "nt" else "bin") / ("python.exe" if os.name == "nt" else "python")
+
+
+def prepare_dependencies(bot_id):
+    bot=get_bot(bot_id)
+    if not bot: return False, "Bot not found."
+    folder=Path(bot[4]); script=folder/bot[3]
+    try:
+        compile(script.read_text(encoding="utf-8",errors="replace"), str(script), "exec")
+    except SyntaxError as e:
+        return False, f"Syntax error: line {e.lineno}: {e.msg}"
+    py=_venv_python(folder)
+    if not py.exists():
+        r=subprocess.run([sys.executable,"-m","venv",str(folder/".venv")],cwd=str(folder),capture_output=True,text=True,timeout=180)
+        if r.returncode != 0: return False, (r.stderr or r.stdout or "venv creation failed")[-1500:]
+    imports=_imports_for_script(script)
+    packages=[]
+    local_names={p.stem for p in folder.glob("*.py")}
+    for mod in sorted(imports):
+        if mod in STDLIB or mod in local_names: continue
+        pkg=IMPORT_TO_PACKAGE.get(mod)
+        if pkg and pkg not in packages: packages.append(pkg)
+    marker=folder/".deps.done"
+    signature="\n".join(packages)
+    if marker.exists() and marker.read_text(errors="ignore") == signature:
+        return True, "Dependencies ready."
+    if packages:
+        cmd=[str(py),"-m","pip","install","--disable-pip-version-check","-q"]+packages
+        r=subprocess.run(cmd,cwd=str(folder),capture_output=True,text=True,timeout=600)
+        if r.returncode != 0: return False, (r.stderr or r.stdout or "dependency installation failed")[-2500:]
+    marker.write_text(signature,encoding="utf-8")
+    return True, "Dependencies ready."
+
+
+def start_bot(bot_id):
+    bot=get_bot(bot_id)
+    if not bot: return False,"Bot not found."
+    bot_id=int(bot[0]); owner_id=int(bot[1]); folder=Path(bot[4]); script=folder/bot[3]
+    if not is_owner(owner_id) and not client_enabled(owner_id): return False,"Client is disabled."
+    if process_alive(bot_id): return False,"Bot is already running."
+    if not script.exists(): return False,"Python file not found."
+    ok,msg=prepare_dependencies(bot_id)
+    if not ok: write_log(bot_id,"DEPENDENCY ERROR: "+msg); return False,msg
+    py=_venv_python(folder)
+    log=log_file(bot_id)
+    try:
+        log.parent.mkdir(parents=True,exist_ok=True)
+        with open(log,"a",encoding="utf-8",errors="replace") as h:
+            h.write("\n\n"+"="*60+f"\nSTARTING BOT {bot_id}\n"+"="*60+"\n")
+            kwargs=dict(cwd=str(folder),stdout=h,stderr=subprocess.STDOUT,stdin=subprocess.DEVNULL)
+            if os.name=="posix": kwargs["start_new_session"]=True
+            process=subprocess.Popen([str(py),"-u",str(script)],**kwargs)
+        with process_lock: processes[bot_id]=process
+        set_bot_status(bot_id,"running"); set_bot_desired(bot_id,True)
+        write_log(bot_id,f"PID: {process.pid}")
+        t=threading.Thread(target=watch_process,args=(bot_id,),daemon=True); watchers[bot_id]=t; t.start()
+        return True,f"Bot started. PID: {process.pid}"
     except Exception as e:
-        print(
-            "Recovery error:",
-            repr(e)
-        )
+        write_log(bot_id,f"START ERROR: {repr(e)}"); return False,str(e)
 
-    polling_loop()
 
+def stop_bot(bot_id, intentional=True):
+    bot_id=int(bot_id)
+    if intentional: set_bot_desired(bot_id,False)
+    with process_lock: process=processes.get(bot_id)
+    if not process:
+        set_bot_status(bot_id,"stopped")
+        return False,"Bot is not running."
+    _kill_process_tree(process)
+    with process_lock: processes.pop(bot_id,None)
+    set_bot_status(bot_id,"stopped"); write_log(bot_id,"Bot stopped.")
+    return True,"Bot stopped."
+
+
+def restart_bot(bot_id):
+    stop_bot(bot_id, intentional=True)
+    time.sleep(.5)
+    return start_bot(bot_id)
+
+
+def watch_process(bot_id):
+    with process_lock: process=processes.get(int(bot_id))
+    if not process: return
+    code=process.wait()
+    with process_lock: processes.pop(int(bot_id),None)
+    write_log(bot_id,f"Process exited with {code}")
+    bot=get_bot(bot_id)
+    if not bot: return
+    set_bot_status(bot_id,"stopped")
+    desired=bool(bot[7]) if len(bot)>=8 else True
+    if code != 0 and bool(bot[6]) and desired and client_enabled(int(bot[1])):
+        time.sleep(2)
+        current=get_bot(bot_id)
+        if current and bool(current[7]):
+            write_log(bot_id,"Auto-restarting after crash...")
+            start_bot(bot_id)
+
+
+def stop_all_bots(owner_id):
+    bots=get_client_bots(owner_id); count=0
+    for b in bots:
+        ok,_=stop_bot(int(b[0]),intentional=True)
+        if ok: count+=1
+    return count
+
+
+def restart_all_bots(owner_id):
+    results=[]
+    for b in get_client_bots(owner_id):
+        ok,msg=restart_bot(int(b[0])); results.append(f"{b[1]}: {msg}")
+    return results
+
+
+def permanently_delete_bot(bot_id):
+    bot=get_bot(bot_id)
+    if not bot: return False,"Bot not found."
+    stop_bot(bot_id, intentional=True)
+    folder=Path(bot[4])
+    with db_lock:
+        db.execute("DELETE FROM bots WHERE id=?",(int(bot_id),)); db.commit()
+    try:
+        if folder.exists(): shutil.rmtree(folder,ignore_errors=True)
+    except Exception as e: return False,f"Database deleted but folder cleanup failed: {e}"
+    return True,"Bot permanently deleted."
+
+
+def remove_client(chat_id):
+    cid=int(chat_id); stop_all_bots(cid)
+    with db_lock:
+        db.execute("DELETE FROM bots WHERE owner_id=?",(cid,)); db.execute("DELETE FROM clients WHERE chat_id=?",(cid,)); db.commit()
+    folder=CLIENTS_DIR/str(cid)
+    if folder.exists(): shutil.rmtree(folder,ignore_errors=True)
+
+
+def show_owner(chat_id):
+    send_message(chat_id,f"""👑 {BRAND}
+
+OWNER CONTROL PANEL
+
+🔐 Access: FULL OWNER
+
+You can manage all clients
+and all hosted bots.
+
+Choose an option below:""",owner_menu())
+
+
+def owner_menu():
+    return {"inline_keyboard":[
+        [{"text":"👥 Clients","callback_data":"clients"},{"text":"➕ Add Client","callback_data":"addclient"}],
+        [{"text":"📊 All Bots","callback_data":"allbots"},{"text":"📈 Host Status","callback_data":"hoststatus"}],
+        [{"text":"▶️ Run All","callback_data":"runall"},{"text":"🛑 Stop All","callback_data":"stopall"}],
+        [{"text":"🔄 Restart All","callback_data":"restartall"}],
+        [{"text":"🔒 Lock All Clients","callback_data":"lockall"},{"text":"🔓 Unlock All Clients","callback_data":"unlockall"}],
+        [{"text":"🔐 Hosting Access","callback_data":"access"}]
+    ]}
+
+
+def client_menu():
+    return {"inline_keyboard":[
+        [{"text":"🤖 My Bots","callback_data":"mybots"}],
+        [{"text":"📤 Upload .py","callback_data":"upload"}],
+        [{"text":"📊 Status","callback_data":"mystatus"}],
+        [{"text":"🔄 Refresh","callback_data":"refresh"}],
+        [{"text":"▶️ Run All","callback_data":"myrunall"},{"text":"🛑 Stop All","callback_data":"mystopall"}],
+        [{"text":"🔄 Restart All","callback_data":"myrestartall"}]
+    ]}
+
+
+def show_client(chat_id):
+    bots=get_client_bots(chat_id); running=sum(1 for b in bots if process_alive(int(b[0])))
+    username=""
+    with db_lock:
+        row=db.execute("SELECT username,first_name,last_name FROM clients WHERE chat_id=?",(int(chat_id),)).fetchone()
+    if row:
+        username=("@"+row[0]) if row[0] else (" ".join(x for x in [row[1],row[2]] if x) or str(chat_id))
+    send_message(chat_id,f"""🤖 {BRAND}
+
+Your bots: {len(bots)}
+Running: {running}
+
+Hosting Panel ready.
+
+Upload one .py file to create a bot.""",client_menu())
+
+
+def show_clients(chat_id):
+    clients=get_clients()
+    if not clients: send_message(chat_id,"👥 CLIENTS\n\nNo clients added yet."); return
+    text=f"👥 {BRAND} CLIENTS\n\n"; keyboard=[]
+    for c in clients:
+        cid,status=c[0],c[1]; username=c[3] if len(c)>3 else ""
+        name=" ".join(x for x in [c[4] if len(c)>4 else "",c[5] if len(c)>5 else ""] if x)
+        label=f"@{username}" if username else (name or str(cid)); icon="🟢" if status=="enabled" else "🔴"
+        count=len(get_client_bots(cid)); text+=f"{icon} {label}\n   🆔 {cid}\n   🤖 Bots: {count}\n   📊 {status.upper()}\n\n"
+        keyboard.append([{"text":f"{icon} {label}","callback_data":f"client:{cid}"}])
+    send_message(chat_id,text,{"inline_keyboard":keyboard})
+
+
+def client_management(chat_id,client_id):
+    with db_lock: found=db.execute("SELECT chat_id,status,username,first_name,last_name FROM clients WHERE chat_id=?",(int(client_id),)).fetchone()
+    if not found: send_message(chat_id,"❌ Client not found."); return
+    label=("@"+found[2]) if found[2] else (" ".join(x for x in [found[3],found[4]] if x) or "No username")
+    status=found[1]; lock="LOCKED" if global_locked() else "UNLOCKED"
+    send_message(chat_id,f"""👤 CLIENT
+
+👤 User: {label}
+🆔 Chat ID: {client_id}
+📊 Status: {status.upper()}
+🔐 Global Lock: {lock}
+🤖 Bots: {len(get_client_bots(client_id))}
+
+Select an action:""",{"inline_keyboard":[
+        [{"text":"🤖 Bots","callback_data":f"clientbots:{client_id}"}],
+        [{"text":"✅ Enable","callback_data":f"enable:{client_id}"},{"text":"🚫 Disable","callback_data":f"disable:{client_id}"}],
+        [{"text":"❌ Permanent Delete","callback_data":f"remove:{client_id}"}],
+        [{"text":"⬅️ Clients","callback_data":"clients"}]
+    ]})
+
+
+def show_bots(chat_id,owner_id):
+    bots=get_client_bots(owner_id)
+    if not bots: send_message(chat_id,"🤖 No bots found."); return
+    text=f"🤖 {BRAND} BOTS\n\n"; keyboard=[]
+    for b in bots:
+        bid,name,filename,status=b[0],b[1],b[2],b[3]; icon="🟢" if process_alive(bid) else "🔴"
+        text+=f"{icon} #{bid} {name}\n   📄 {filename}\n   📊 {status}\n\n"
+        keyboard.append([{"text":f"🤖 #{bid} {name}","callback_data":f"bot:{bid}"}])
+    send_message(chat_id,text,{"inline_keyboard":keyboard})
+
+
+def bot_management(chat_id,bot_id):
+    bot=get_bot(bot_id)
+    if not bot: send_message(chat_id,"❌ Bot not found."); return
+    owner=int(bot[1])
+    if not is_owner(chat_id) and int(chat_id)!=owner: send_message(chat_id,"🚫 Access denied."); return
+    running=process_alive(bot_id)
+    send_message(chat_id,f"""🤖 BOT CONTROL
+
+🆔 Bot ID: {bot_id}
+📛 Name: {bot[2]}
+📄 File: {bot[3]}
+
+📊 Status: {'🟢 RUNNING' if running else '🔴 STOPPED'}
+👤 Owner: {owner}
+🔁 Auto Restart: {'ON' if bot[6] else 'OFF'}""",{"inline_keyboard":[
+        [{"text":"▶️ Run","callback_data":f"run:{bot_id}"},{"text":"🛑 Stop","callback_data":f"stop:{bot_id}"}],
+        [{"text":"🔄 Restart","callback_data":f"restart:{bot_id}"}],
+        [{"text":"📜 Logs","callback_data":f"logs:{bot_id}"}],
+        [{"text":"🗑️ Permanent Delete","callback_data":f"deletebot:{bot_id}"}]
+    ]})
+
+
+def show_access(chat_id):
+    if not is_owner(chat_id): return
+    clients=get_clients(); text="🔐 HOSTING ACCESS\n\nTap a client to enable/disable access.\n\n"; kb=[]
+    for c in clients:
+        cid,status=c[0],c[1]; u=c[3] if len(c)>3 else ""; label=("@"+u) if u else str(cid); icon="🟢" if status=="enabled" else "🔴"
+        kb.append([{"text":f"{icon} {label}","callback_data":f"accessclient:{cid}"}])
+    send_message(chat_id,text,{"inline_keyboard":kb})
+
+
+def show_access_client(chat_id,cid):
+    if not is_owner(chat_id): return
+    with db_lock: row=db.execute("SELECT status,username,first_name,last_name FROM clients WHERE chat_id=?",(int(cid),)).fetchone()
+    if not row: send_message(chat_id,"❌ Client not found."); return
+    label=("@"+row[1]) if row[1] else (" ".join(x for x in [row[2],row[3]] if x) or str(cid))
+    send_message(chat_id,f"🔐 HOSTING ACCESS\n\n👤 {label}\n🆔 {cid}\n📊 {row[0].upper()}",{"inline_keyboard":[[{"text":"✅ Enable","callback_data":f"enable:{cid}"},{"text":"🚫 Disable","callback_data":f"disable:{cid}"}],[{"text":"⬅️ Access List","callback_data":"access"}]]})
+
+
+def permanent_delete_confirm(chat_id,kind,ident):
+    user_states[int(chat_id)]={"state":"delete_confirm","kind":kind,"id":int(ident)}
+    send_message(chat_id,f"⚠️ PERMANENT DELETE\n\nThis action is IRREVERSIBLE.\nThe selected {kind} and its stored files/logs will be permanently deleted.\n\nType exactly: CONFIRM\n\nOr send /cancel to cancel.")
+
+
+def run_all_for_owner(owner_id):
+    count=0
+    for b in get_client_bots(owner_id):
+        ok,_=start_bot(int(b[0]))
+        if ok: count+=1
+    return count
+
+
+def render_health_server():
+    class HealthHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            body=b"KRUTIK CYBER EXPERT HOST OK\n"
+            self.send_response(200); self.send_header("Content-Type","text/plain; charset=utf-8"); self.send_header("Content-Length",str(len(body))); self.end_headers(); self.wfile.write(body)
+        def log_message(self,*args): pass
+    port=int(os.getenv("PORT","10000"))
+    server=ThreadingHTTPServer(("0.0.0.0",port),HealthHandler)
+    print(f"🌐 Render health server listening on 0.0.0.0:{port}")
+    server.serve_forever()
+
+
+def recover_bots():
+    with db_lock:
+        rows=db.execute("SELECT id,owner_id,desired_running FROM bots WHERE desired_running=1").fetchall()
+    for r in rows:
+        if client_enabled(int(r[1])):
+            threading.Thread(target=lambda bid=int(r[0]): start_bot(bid),daemon=True).start()
+
+
+def handle_callback(callback):
+    callback_id=callback.get("id"); answer_callback(callback_id)
+    message=callback.get("message",{}); chat=message.get("chat",{}); chat_id=chat.get("id"); data=callback.get("data","")
+    if not authorized(chat_id):
+        send_message(chat_id,f"🚫 ACCESS DENIED\n\n{BRAND}\n\nYour Chat ID is not authorized.\n\n🆔 {chat_id}\n\nPlease contact the owner."); return
+    if not is_owner(chat_id) and global_locked():
+        # Owner retains full access. Registration/notification is unaffected; controls are blocked.
+        send_message(chat_id,f"🔒 {BRAND}\n\nAll client hosting access is temporarily locked by the owner."); return
+    if data=="clients" and is_owner(chat_id): show_clients(chat_id); return
+    if data=="addclient" and is_owner(chat_id): user_states[chat_id]="add_client"; send_message(chat_id,"➕ ADD CLIENT\n\nSend the client's Telegram Chat ID.\n\nExample:\n123456789\n\nSend /cancel to cancel."); return
+    if data=="hoststatus" and is_owner(chat_id):
+        with db_lock: total=db.execute("SELECT COUNT(*) FROM bots").fetchone()[0]
+        with process_lock: running=sum(1 for p in processes.values() if p.poll() is None)
+        send_message(chat_id,f"📊 {BRAND} HOST STATUS\n\n🤖 Total Bots: {total}\n🟢 Running: {running}\n🔴 Stopped: {total-running}\n\n👥 Clients: {len(get_clients())}\n\n⏱️ Host Uptime: {int(time.time()-START_TIME)} seconds"); return
+    if data=="allbots" and is_owner(chat_id):
+        rows=[]
+        with db_lock: rows=db.execute("SELECT id,owner_id,name,status FROM bots ORDER BY id").fetchall()
+        text="📊 ALL BOTS\n\n"+("No bots." if not rows else "".join(f"#{r[0]} {r[2]}\n👤 Owner: {r[1]}\n📊 {r[3]}\n\n" for r in rows)); send_message(chat_id,text); return
+    if data=="runall" and is_owner(chat_id): send_message(chat_id,f"▶️ Run All complete.\n\nStarted: {sum(1 for b in get_client_bots(0) if False) if False else run_all_global()}"); return
+    if data=="stopall" and is_owner(chat_id):
+        with db_lock: ids=[r[0] for r in db.execute("SELECT id FROM bots").fetchall()]
+        stopped=sum(1 for bid in ids if stop_bot(bid,True)[0]); send_message(chat_id,f"🛑 Stop All complete.\n\nStopped: {stopped}"); return
+    if data=="restartall" and is_owner(chat_id):
+        with db_lock: ids=[r[0] for r in db.execute("SELECT id FROM bots").fetchall()]
+        n=sum(1 for bid in ids if restart_bot(bid)[0]); send_message(chat_id,f"🔄 Restart All complete.\n\nRestarted: {n}"); return
+    if data=="lockall" and is_owner(chat_id): set_global_lock(True); send_message(chat_id,"🔒 All Clients LOCKED.\n\nOwner access remains active."); return
+    if data=="unlockall" and is_owner(chat_id): set_global_lock(False); send_message(chat_id,"🔓 All Clients UNLOCKED."); return
+    if data=="access" and is_owner(chat_id): show_access(chat_id); return
+    if data.startswith("accessclient:") and is_owner(chat_id): show_access_client(chat_id,int(data.split(":",1)[1])); return
+    if data.startswith("client:") and is_owner(chat_id): client_management(chat_id,int(data.split(":",1)[1])); return
+    if data.startswith("enable:") and is_owner(chat_id): set_client_status(int(data.split(":",1)[1]),"enabled"); send_message(chat_id,"✅ Client ENABLED."); return
+    if data.startswith("disable:") and is_owner(chat_id): cid=int(data.split(":",1)[1]); set_client_status(cid,"disabled"); stop_all_bots(cid); send_message(chat_id,f"🚫 Client disabled.\n\n🆔 {cid}\n\nAll of this client's running bots have been stopped."); return
+    if data.startswith("remove:") and is_owner(chat_id): permanent_delete_confirm(chat_id,"client",int(data.split(":",1)[1])); return
+    if data.startswith("clientbots:") and is_owner(chat_id): show_bots(chat_id,int(data.split(":",1)[1])); return
+    if data=="mybots": show_bots(chat_id,chat_id); return
+    if data=="upload": user_states[chat_id]="upload"; send_message(chat_id,f"📤 {BRAND}\n\nBOT UPLOAD\n\nSend your Python `.py` file now.\n\nExample:\nmybot.py\n\nThe bot will be stored inside\nyour private client folder."); return
+    if data in ("mystatus","refresh"): show_client(chat_id) if data=="refresh" else send_message(chat_id,f"📊 YOUR STATUS\n\n🤖 Total Bots: {len(get_client_bots(chat_id))}\n🟢 Running: {sum(1 for b in get_client_bots(chat_id) if process_alive(b[0]))}\n🔴 Stopped: {sum(1 for b in get_client_bots(chat_id) if not process_alive(b[0]))}\n\n🏷️ {BRAND}"); return
+    if data=="myrunall": send_message(chat_id,f"▶️ Started {run_all_for_owner(chat_id)} bot(s)."); return
+    if data=="mystopall": send_message(chat_id,f"🛑 Stopped {stop_all_bots(chat_id)} bot(s)."); return
+    if data=="myrestartall": send_message(chat_id,"🔄 Restart All\n\n"+"\n".join(restart_all_bots(chat_id))); return
+    if data.startswith("bot:"):
+        bid=int(data.split(":",1)[1]); bot=get_bot(bid)
+        if bot and (is_owner(chat_id) or int(bot[1])==int(chat_id)): bot_management(chat_id,bid)
+        return
+    if data.startswith("run:"):
+        bid=int(data.split(":",1)[1]); bot=get_bot(bid)
+        if bot and (is_owner(chat_id) or int(bot[1])==int(chat_id)):
+            ok,msg=start_bot(bid); send_message(chat_id,("✅ " if ok else "❌ ")+msg)
+        return
+    if data.startswith("stop:"):
+        bid=int(data.split(":",1)[1]); bot=get_bot(bid)
+        if bot and (is_owner(chat_id) or int(bot[1])==int(chat_id)):
+            ok,msg=stop_bot(bid,True); send_message(chat_id,("✅ " if ok else "❌ ")+msg)
+        return
+    if data.startswith("restart:"):
+        bid=int(data.split(":",1)[1]); bot=get_bot(bid)
+        if bot and (is_owner(chat_id) or int(bot[1])==int(chat_id)):
+            ok,msg=restart_bot(bid); send_message(chat_id,("✅ " if ok else "❌ ")+msg)
+        return
+    if data.startswith("logs:"): send_logs(chat_id,int(data.split(":",1)[1])); return
+    if data.startswith("deletebot:"):
+        bid=int(data.split(":",1)[1]); bot=get_bot(bid)
+        if bot and (is_owner(chat_id) or int(bot[1])==int(chat_id)): permanent_delete_confirm(chat_id,"bot",bid)
+        return
+
+
+def run_all_global():
+    with db_lock: ids=[r[0] for r in db.execute("SELECT id FROM bots").fetchall()]
+    n=0
+    for bid in ids:
+        if start_bot(bid)[0]: n+=1
+    return n
+
+
+def download_document(message, owner_id):
+    if not control_allowed(owner_id): return
+    document=message.get("document") or {}; filename=safe_filename(document.get("file_name","bot.py"))
+    if not filename.lower().endswith(".py"): send_message(owner_id,"❌ Sirf `.py` files upload karo."); return
+    if int(document.get("file_size",0) or 0)>MAX_UPLOAD_SIZE: send_message(owner_id,"❌ File 2 MB se badi hai."); return
+    result=api("getFile",{"file_id":document.get("file_id")})
+    if not result.get("ok"): send_message(owner_id,"❌ Telegram file information nahi mil saki."); return
+    try:
+        response=session.get(f"https://api.telegram.org/file/bot{BOT_TOKEN}/{result['result']['file_path']}",timeout=60)
+        if response.status_code!=200 or len(response.content)>MAX_UPLOAD_SIZE: send_message(owner_id,"❌ File download failed or file too large."); return
+        name=Path(filename).stem; bid=create_bot(owner_id,name,filename); bot=get_bot(bid); folder=Path(bot[4]); target=folder/filename; target.write_bytes(response.content)
+        ok,msg=prepare_dependencies(bid)
+        if not ok:
+            send_message(owner_id,f"❌ BOT UPLOAD\n\nBot #{bid} created, but dependency/syntax preparation failed:\n{msg}", {"inline_keyboard":[[{"text":"🤖 Bot Control","callback_data":f"bot:{bid}"}]]}); return
+        send_message(owner_id,f"""✅ BOT UPLOADED
+
+🏷️ {BRAND}
+
+🤖 Bot ID: {bid}
+📛 Name: {name}
+📄 File: {filename}
+
+📁 Client data:
+{folder}
+
+Now you can ▶️ Run the bot.""",{"inline_keyboard":[[{"text":"▶️ Run Now","callback_data":f"run:{bid}"}],[{"text":"🤖 Bot Control","callback_data":f"bot:{bid}"}] ]})
+    except Exception as e: send_message(owner_id,f"❌ Upload error:\n{e}")
+
+
+def handle_message(message):
+    chat_id=int(message["chat"]["id"]); text=message.get("text","")
+    if not is_owner(chat_id): register_client_if_needed(message)
+    if "document" in message:
+        if not authorized(chat_id): send_message(chat_id,f"🚫 {BRAND}\n\nAccess denied."); return
+        download_document(message,chat_id); return
+    if text=="/cancel": user_states.pop(chat_id,None); send_message(chat_id,"❌ Current operation cancelled."); return
+    if text.startswith("/start"):
+        if is_owner(chat_id): show_owner(chat_id); return
+        if global_locked(): send_message(chat_id,f"🔒 {BRAND}\n\nYour client access is currently locked by the owner."); return
+        if client_enabled(chat_id): show_client(chat_id); return
+        send_message(chat_id,f"🚫 ACCESS DENIED\n\n{BRAND}\n\nYour hosting access is disabled.\n\n🆔 {chat_id}\n\nContact the owner for access."); return
+    state=user_states.get(chat_id)
+    if isinstance(state,dict) and state.get("state")=="delete_confirm":
+        if text.strip()=="CONFIRM":
+            kind=state["kind"]; ident=state["id"]
+            user_states.pop(chat_id,None)
+            if kind=="bot":
+                bot=get_bot(ident)
+                if bot and (is_owner(chat_id) or int(bot[1])==chat_id):
+                    ok,msg=permanently_delete_bot(ident); send_message(chat_id,("✅ " if ok else "❌ ")+msg)
+                else: send_message(chat_id,"❌ Bot not found or access denied.")
+            else:
+                if is_owner(chat_id): remove_client(ident); send_message(chat_id,"✅ Client and all of its bots/files/logs permanently deleted.")
+            return
+        send_message(chat_id,"⚠️ Confirmation not received. Type exactly CONFIRM, or /cancel."); return
+    if state=="add_client":
+        if not is_owner(chat_id): return
+        if text.isdigit() and int(text)!=OWNER_CHAT_ID:
+            add_client(int(text)); user_states.pop(chat_id,None); send_message(chat_id,f"✅ CLIENT ADDED\n\n🆔 Chat ID: {text}\n📊 Status: ENABLED\n\nThe client can now access\n{BRAND}.")
+        else: send_message(chat_id,"❌ Invalid Chat ID.\n\nOnly numbers allowed and owner ID cannot be added as client.")
+        return
+    if not authorized(chat_id): send_message(chat_id,f"🚫 ACCESS DENIED\n\n{BRAND}\n\nYou are not an authorized client.\n\n🆔 Chat ID: {chat_id}"); return
+    if not is_owner(chat_id) and global_locked(): send_message(chat_id,f"🔒 {BRAND}\n\nAll client hosting access is temporarily locked by the owner."); return
+    if text=="/panel": show_owner(chat_id) if is_owner(chat_id) else show_client(chat_id); return
+    if text=="/clients" and is_owner(chat_id): show_clients(chat_id); return
+    if text=="/bots": show_bots(chat_id,chat_id); return
+    if text=="/status": send_message(chat_id,f"📊 YOUR STATUS\n\n👤 Client ID: {chat_id}\n\n🤖 Total Bots: {len(get_client_bots(chat_id))}\n🟢 Running: {sum(1 for b in get_client_bots(chat_id) if process_alive(b[0]))}\n🔴 Stopped: {sum(1 for b in get_client_bots(chat_id) if not process_alive(b[0]))}\n\n🏷️ {BRAND}"); return
+
+
+def polling():
+    print(f"🚀 {BRAND} HOST STARTING...")
+    result=api("getMe")
+    if not result.get("ok"): print("❌ Telegram API error:",result); return
+    print(f"🤖 @{result['result'].get('username')}"); print("🟢 Telegram API: OK")
+    api("deleteWebhook",{"drop_pending_updates":True})
+    offset=None
+    while True:
+        try:
+            data={"timeout":8,"limit":50,"allowed_updates":json.dumps(["message","callback_query"])}
+            if offset is not None: data["offset"]=offset
+            result=api("getUpdates",data,timeout=12)
+            if not result.get("ok"): print("⚠️ Telegram error:",result); time.sleep(1); continue
+            for update in result.get("result",[]):
+                offset=update["update_id"]+1
+                try:
+                    if "message" in update: handle_message(update["message"])
+                    elif "callback_query" in update: handle_callback(update["callback_query"])
+                except Exception as e: print("⚠️ Update error:",repr(e))
+        except KeyboardInterrupt: print("\n🛑 Host stopped."); break
+        except Exception as e: print("🔄 Reconnecting:",repr(e)); time.sleep(1)
+
+
+def main():
+    if not BOT_TOKEN or BOT_TOKEN=="PUT_YOUR_HOST_BOT_TOKEN_HERE": print("❌ BOT_TOKEN set karo."); return
+    if not OWNER_CHAT_ID or OWNER_CHAT_ID==123456789: print("❌ OWNER_CHAT_ID set karo."); return
+    print("="*60); print(f"🔥 {BRAND}"); print("🚀 MULTI-CLIENT PYTHON HOST"); print("="*60)
+    threading.Thread(target=render_health_server,daemon=True).start()
+    time.sleep(.2)
+    recover_bots()
+    polling()
 
 if __name__ == "__main__":
+
     main()
