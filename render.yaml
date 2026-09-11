@@ -12,4 +12,3 @@ services:
         sync: false
       - key: DATA_DIR
         sync: false
-        
